@@ -1,0 +1,90 @@
+﻿<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Activate access</title>
+<link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <div class="ticket">
+    <div class="ticket-head">
+      <div class="eyebrow" id="eyebrow">Checking pass&hellip;</div>
+      <h1 id="title">Temporary Access</h1>
+    </div>
+    <div class="perf"></div>
+    <div class="ticket-body" id="body">
+      <span class="badge pending" id="badge">Verifying</span>
+      <div class="countdown" id="countdown">&mdash;</div>
+      <div class="countdown-label" id="countdownLabel">&nbsp;</div>
+      <p class="muted" id="message">Reading your access link&hellip;</p>
+      <button class="primary" id="continueBtn" style="display:none">Continue to login</button>
+      <div class="error-text" id="errorText"></div>
+    </div>
+  </div>
+
+<script>
+ const token = window.location.pathname.split('/').pop();
+  const $ = (id) => document.getElementById(id);
+
+  function setBadge(state, text) {
+    const b = $('badge');
+    b.className = 'badge ' + state;
+    b.textContent = text;
+  }
+
+  function formatRemaining(ms) {
+    if (ms <= 0) return '00:00:00';
+    const totalSec = Math.floor(ms / 1000);
+    const h = String(Math.floor(totalSec / 3600)).padStart(2, '0');
+    const m = String(Math.floor((totalSec % 3600) / 60)).padStart(2, '0');
+    const s = String(totalSec % 60).padStart(2, '0');
+    return `${h}:${m}:${s}`;
+  }
+
+  let tickHandle;
+  function startCountdown(expiresAtIso) {
+    const expiresAt = new Date(expiresAtIso).getTime();
+    $('countdownLabel').textContent = 'Time remaining';
+    const tick = () => {
+      const remaining = expiresAt - Date.now();
+      $('countdown').textContent = formatRemaining(remaining);
+      if (remaining <= 0) clearInterval(tickHandle);
+    };
+    tick();
+    tickHandle = setInterval(tick, 1000);
+  }
+
+  async function activate() {
+    try {
+      const res = await fetch(`/api/activate/${token}`);
+      const data = await res.json();
+
+      if (!res.ok) {
+        setBadge('error', 'Invalid');
+        $('eyebrow').textContent = 'Access link';
+        $('title').textContent = 'Not available';
+        $('message').textContent = data.error || 'This link could not be verified.';
+        $('countdownLabel').textContent = '';
+        return;
+      }
+
+      setBadge('active', 'Active');
+      $('eyebrow').textContent = 'Access link';
+      $('title').textContent = 'Pass activated';
+      $('message').textContent = 'Your access window has started. Log in with the credentials from your email to continue.';
+      startCountdown(data.expiresAt);
+      $('continueBtn').style.display = 'block';
+      $('continueBtn').addEventListener('click', () => {
+        window.location.href = '/login.html';
+      });
+    } catch (err) {
+      setBadge('error', 'Error');
+      $('message').textContent = 'Could not reach the server. Check your connection and try again.';
+    }
+  }
+
+  activate();
+</script>
+</body>
+</html>

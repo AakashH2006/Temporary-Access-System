@@ -1,0 +1,73 @@
+﻿<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Log in â€” Temporary Access</title>
+<link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <div class="ticket">
+    <div class="ticket-head">
+      <div class="eyebrow">Temporary Access</div>
+      <h1>Log in</h1>
+    </div>
+    <div class="perf"></div>
+    <div class="ticket-body">
+      <p class="muted">Use the email and temporary password from your access email.</p>
+
+      <form id="loginForm">
+        <label for="email">Email</label>
+        <input id="email" type="email" autocomplete="username" required />
+
+        <label for="password">Temporary password</label>
+        <input id="password" type="password" autocomplete="current-password" required />
+
+        <button class="primary" id="submitBtn" type="submit">Log in</button>
+      </form>
+      <div class="error-text" id="errorText"></div>
+    </div>
+  </div>
+
+<script>
+  const $ = (id) => document.getElementById(id);
+
+  $('loginForm').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const email = $('email').value.trim();
+    const password = $('password').value;
+    const btn = $('submitBtn');
+    const err = $('errorText');
+    err.classList.remove('show');
+    btn.disabled = true;
+    btn.textContent = 'Logging inâ€¦';
+
+    try {
+      const res = await fetch('/api/auth/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email, password }),
+      });
+      const data = await res.json();
+
+      if (!res.ok) {
+        err.textContent = data.error || 'Login failed.';
+        err.classList.add('show');
+        btn.disabled = false;
+        btn.textContent = 'Log in';
+        return;
+      }
+
+      sessionStorage.setItem('sessionToken', data.sessionToken);
+      sessionStorage.setItem('expiresAt', data.expiresAt);
+      window.location.href = '/dashboard.html';
+    } catch (e2) {
+      err.textContent = 'Could not reach the server.';
+      err.classList.add('show');
+      btn.disabled = false;
+      btn.textContent = 'Log in';
+    }
+  });
+</script>
+</body>
+</html>

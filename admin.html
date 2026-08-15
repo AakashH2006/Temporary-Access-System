@@ -1,0 +1,92 @@
+﻿<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Grant Access â€” Admin</title>
+<link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <div class="ticket" style="max-width:440px">
+    <div class="ticket-head">
+      <div class="eyebrow">Admin</div>
+      <h1>Grant temporary access</h1>
+    </div>
+    <div class="perf"></div>
+    <div class="ticket-body">
+      <label for="adminKey">Admin key</label>
+      <input id="adminKey" type="password" placeholder="X-Admin-Key" />
+
+      <label for="email">Email</label>
+      <input id="email" type="email" placeholder="user@example.com" />
+
+      <label for="duration">Access duration</label>
+      <select id="duration">
+        <option value="1">1 hour</option>
+        <option value="8" selected>8 hours</option>
+        <option value="24">24 hours</option>
+        <option value="72">3 days</option>
+        <option value="168">7 days</option>
+      </select>
+
+      <button class="primary" id="submit">Grant access</button>
+
+      <div id="resultWrap" style="display:none; margin-top:20px">
+        <div class="kv"><span>Status</span><span id="rStatus">&mdash;</span></div>
+        <div class="kv"><span>Email</span><span id="rEmail">&mdash;</span></div>
+        <div class="stamp" id="rDetail"></div>
+      </div>
+      <div class="error-text" id="errorText"></div>
+    </div>
+  </div>
+
+<script>
+  const $ = (id) => document.getElementById(id);
+
+  $('submit').addEventListener('click', async () => {
+    const adminKey = $('adminKey').value;
+    const email = $('email').value;
+    const durationHours = Number($('duration').value);
+    const btn = $('submit');
+    const err = $('errorText');
+    err.classList.remove('show');
+    $('resultWrap').style.display = 'none';
+    btn.disabled = true;
+    btn.textContent = 'Sendingâ€¦';
+
+    try {
+      const res = await fetch('/api/admin/grants', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Admin-Key': adminKey },
+        body: JSON.stringify({ email, durationHours }),
+      });
+      const data = await res.json();
+      btn.disabled = false;
+      btn.textContent = 'Grant access';
+
+      if (!res.ok) {
+        err.textContent = data.error || 'Request failed.';
+        err.classList.add('show');
+        return;
+      }
+
+      $('resultWrap').style.display = 'block';
+      if (data.warning) {
+        $('rStatus').textContent = 'Created (email failed)';
+        $('rEmail').textContent = data.grant.email;
+        $('rDetail').textContent = data.accessUrl || data.detail;
+      } else {
+        $('rStatus').textContent = 'Sent';
+        $('rEmail').textContent = data.grant.email;
+        $('rDetail').textContent = data.accessUrl;
+      }
+    } catch (e) {
+      btn.disabled = false;
+      btn.textContent = 'Grant access';
+      err.textContent = 'Could not reach the server.';
+      err.classList.add('show');
+    }
+  });
+</script>
+</body>
+</html>

@@ -1,0 +1,104 @@
+﻿<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Dashboard â€” Temporary Access</title>
+<link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <div class="ticket">
+    <div class="ticket-head">
+      <div class="eyebrow" id="eyebrow">Checking session&hellip;</div>
+      <h1 id="title">Dashboard</h1>
+    </div>
+    <div class="perf"></div>
+    <div class="ticket-body" id="body" style="display:none">
+      <span class="badge active">Authenticated</span>
+      <div class="countdown" id="countdown">&mdash;</div>
+      <div class="countdown-label">Access expires in</div>
+      <div class="stamp" id="emailStamp"></div>
+      <button class="ghost" id="logoutBtn">Log out</button>
+    </div>
+    <div class="ticket-body" id="deniedBody" style="display:none">
+      <span class="badge error">Denied</span>
+      <p class="muted" id="deniedMsg" style="margin-top:14px"></p>
+      <button class="primary" id="toLoginBtn">Go to login</button>
+    </div>
+  </div>
+
+<script>
+  const $ = (id) => document.getElementById(id);
+  const token = sessionStorage.getItem('sessionToken');
+  const expiresAt = sessionStorage.getItem('expiresAt');
+
+  function deny(message) {
+    $('eyebrow').textContent = 'Temporary Access';
+    $('title').textContent = 'Not authenticated';
+    $('body').style.display = 'none';
+    $('deniedBody').style.display = 'block';
+    $('deniedMsg').textContent = message;
+    $('toLoginBtn').addEventListener('click', () => window.location.href = '/login.html');
+  }
+
+  function formatRemaining(ms) {
+    if (ms <= 0) return '00:00:00';
+    const totalSec = Math.floor(ms / 1000);
+    const h = String(Math.floor(totalSec / 3600)).padStart(2, '0');
+    const m = String(Math.floor((totalSec % 3600) / 60)).padStart(2, '0');
+    const s = String(totalSec % 60).padStart(2, '0');
+    return `${h}:${m}:${s}`;
+  }
+
+  async function load() {
+    if (!token) return deny('No active session. Log in to continue.');
+
+    try {
+      const res = await fetch('/api/app/me', {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      const data = await res.json();
+
+      if (!res.ok) {
+        sessionStorage.clear();
+        return deny(data.error || 'Your session is no longer valid.');
+      }
+
+      $('eyebrow').textContent = 'Temporary Access';
+      $('title').textContent = 'Welcome';
+      $('body').style.display = 'block';
+      $('emailStamp').textContent = data.email;
+
+      const exp = new Date(expiresAt).getTime();
+      const tick = () => {
+        const remaining = exp - Date.now();
+        $('countdown').textContent = formatRemaining(remaining);
+        if (remaining <= 0) {
+          sessionStorage.clear();
+          deny('Your access window has ended.');
+        }
+      };
+      tick();
+      setInterval(tick, 1000);
+    } catch (e) {
+      deny('Could not reach the server.');
+    }
+  }
+
+  $('logoutBtn').addEventListener('click', async () => {
+    try {
+      await fetch('/api/auth/logout', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}` },
+      });
+    } catch (e) {
+      // proceed to clear locally even if the request fails
+    }
+    sessionStorage.clear();
+    window.location.href = '/login.html';
+  });
+
+  load();
+</script>
+</body>
+</html>
