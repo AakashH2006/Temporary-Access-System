@@ -142,6 +142,136 @@ you can carry on.
 Point `UPSTREAM_URL` at the real application when you have one. Nothing else
 changes.
 
+## Seeing it work
+
+A real transcript against a local gateway, with `demo-app` standing in for the
+internal application. The whole lifecycle is seven requests and about ten
+seconds.
+
+**1. The admin signs in.** No shared key — an account made by `create-admin`.
+
+```console
+$ curl -sS -i -X POST localhost:3000/__access/api/admin/auth/login \
+    -H 'Content-Type: application/json' \
+    -d '{"email":"admin@example.com","password":"..."}'
+
+HTTP/1.1 200 OK
+Set-Cookie: ta_admin=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...; Max-Age=3600;
+            Path=/__access; HttpOnly; SameSite=Strict
+```
+
+`Path=/__access` and `SameSite=Strict` are both load-bearing: the admin cookie
+is never attached to a proxied request, so it cannot reach the upstream app,
+and it is never sent cross-site.
+
+**2. The admin issues two hours to a customer.**
+
+```console
+$ curl -sS -X POST localhost:3000/__access/api/admin/grants \
+    -H 'Content-Type: application/json' -H "Cookie: $ADMIN" \
+    -d '{"email":"dana@acme-partner.com","durationHours":2}'
+
+{
+  "grant": {
+    "id": "1a1b1a53-1054-4c76-8ddc-8c94664f48b3",
+    "email": "dana@acme-partner.com",
+    "status": "PENDING"
+  },
+  "accessUrl": "https://access.example.com/__access/link/288783494",
+  "warning": "Grant created, but the email failed to send. Relay these credentials manually.",
+  "password": "6WgAoaxLd68pba9N"
+}
+```
+
+`PENDING`, and no clock running yet. The `warning` is the unverified-domain
+path described under [Email](DEPLOY.md#email): the grant is perfectly valid, and
+the password is returned exactly once so the admin can relay it by hand.
+
+**3. The customer opens the emailed link.** This is what starts the two hours —
+not the moment the grant was created.
+
+```console
+$ curl -sS localhost:3000/__access/api/activate/288783494
+
+{ "message": "Access activated.",
+  "activatedAt": "2026-08-29T06:17:58.146Z",
+  "expiresAt":  "2026-08-29T08:17:58.146Z" }
+```
+
+**4. The customer logs in** with the emailed password.
+
+```console
+HTTP/1.1 200 OK
+Set-Cookie: ta_session=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...; Max-Age=3600;
+            Path=/; HttpOnly; SameSite=Lax
+```
+
+`Lax` here, not `Strict`, because this cookie has to survive the customer
+arriving from a link in their mail client.
+
+**5. They reach the internal app** — the point of the entire system.
+
+```console
+$ curl -sS -i localhost:3000/ -H 'Accept: text/html' -H "Cookie: $SESSION"
+
+HTTP/1.1 200 OK
+Content-Type: text/html; charset=utf-8
+
+<h1>Internal Application</h1>
+<p>You are inside the VPN-hosted app, reached through the temporary access gateway.</p>
+<div class="card">
+  <p>The gateway told me who you are:</p>
+  <p class="who">dana@acme-partner.com</p>
+</div>
+...
+<script>/* countdown bar injected by the gateway */</script>
+```
+
+The app rendered that email itself, from the `X-Temp-Access-Email` header the
+gateway set. It implements none of this. The customer, meanwhile, holds no VPN
+credentials and has no route into the internal network — they reached exactly
+one host, through the gateway.
+
+**6. Time remaining**, which is also what the injected bar polls:
+
+```console
+$ curl -sS localhost:3000/__access/api/session -H "Cookie: $SESSION"
+
+{ "email": "dana@acme-partner.com",
+  "expiresAt": "2026-08-29T08:17:58.146Z",
+  "remainingSeconds": 7199 }
+```
+
+**7. The admin revokes**, with 119 minutes still on the clock.
+
+```console
+$ curl -sS -X POST \
+    localhost:3000/__access/api/admin/grants/1a1b1a53-.../revoke \
+    -H "Cookie: $ADMIN"
+
+{"grant":{"id":"1a1b1a53-...","status":"REVOKED"}}
+```
+
+**Six seconds later the same cookie is dead** — no logout, no expiry, nothing
+the customer's browser did:
+
+```console
+$ curl -sS -i localhost:3000/ -H 'Accept: text/html' -H "Cookie: $SESSION"
+
+HTTP/1.1 302 Found
+Location: /__access/login?next=%2F&reason=revoked
+```
+
+That last pair is the part worth dwelling on. The session cookie is still
+unexpired and still correctly signed — it stops working because authorization is
+re-checked against Postgres on *every proxied request*, not just at login. That
+is what lets a revoke or an expiry reach someone already inside the app, rather
+than waiting for them to come back and log in again.
+
+The same flow in a browser: sign in at `/__access/admin`, issue a grant, open
+the link from the email, and the app appears with a countdown bar pinned to the
+top of every one of its pages.
+
 ## Admin authentication
 
 Whoever holds admin access can mint access to the internal network for anyone,
