@@ -4,6 +4,16 @@ Lets a customer who has **no VPN credentials** reach a VPN-hosted application
 for a window of time an admin decides — through a browser, with nothing to
 install.
 
+![The whole lifecycle: an admin issues a one-hour grant, the customer activates
+the link and logs in, reaches the internal app with a countdown bar, and is cut
+off mid-session when the admin revokes.](docs/demo.gif)
+
+*The full lifecycle against a local gateway, with `demo-app` standing in for the
+internal application. Note the last two frames: the admin revokes with 56
+minutes still on the clock, and the very next request bounces to
+`?reason=revoked` — the session cookie was still unexpired and still correctly
+signed.*
+
 An admin enters an email and a duration. The system emails a one-time link and
 a temporary password. Opening the link starts the clock. From then until the
 window closes, that person's browser reaches the internal app through this
@@ -114,6 +124,7 @@ scripts/create-admin.js the only way an admin account is created
 deploy/
   nginx.conf            TLS termination and websocket upgrade
   temp-access.service   systemd unit
+docs/demo.gif           the recording at the top of this file
 DEPLOY.md               production runbook
 .env.example            annotated configuration template
 ```
