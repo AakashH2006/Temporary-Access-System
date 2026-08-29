@@ -1,10 +1,10 @@
-﻿<!doctype html>
+<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>Activate access</title>
-<link rel="stylesheet" href="/styles.css" />
+<link rel="stylesheet" href="/__access/styles.css" />
 </head>
 <body>
   <div class="ticket">
@@ -13,7 +13,7 @@
       <h1 id="title">Temporary Access</h1>
     </div>
     <div class="perf"></div>
-    <div class="ticket-body" id="body">
+    <div class="ticket-body">
       <span class="badge pending" id="badge">Verifying</span>
       <div class="countdown" id="countdown">&mdash;</div>
       <div class="countdown-label" id="countdownLabel">&nbsp;</div>
@@ -24,8 +24,8 @@
   </div>
 
 <script>
- const token = window.location.pathname.split('/').pop();
   const $ = (id) => document.getElementById(id);
+  const token = window.location.pathname.split('/').pop();
 
   function setBadge(state, text) {
     const b = $('badge');
@@ -35,11 +35,11 @@
 
   function formatRemaining(ms) {
     if (ms <= 0) return '00:00:00';
-    const totalSec = Math.floor(ms / 1000);
-    const h = String(Math.floor(totalSec / 3600)).padStart(2, '0');
-    const m = String(Math.floor((totalSec % 3600) / 60)).padStart(2, '0');
-    const s = String(totalSec % 60).padStart(2, '0');
-    return `${h}:${m}:${s}`;
+    const total = Math.floor(ms / 1000);
+    const h = String(Math.floor(total / 3600)).padStart(2, '0');
+    const m = String(Math.floor((total % 3600) / 60)).padStart(2, '0');
+    const s = String(total % 60).padStart(2, '0');
+    return h + ':' + m + ':' + s;
   }
 
   let tickHandle;
@@ -57,7 +57,7 @@
 
   async function activate() {
     try {
-      const res = await fetch(`/api/activate/${token}`);
+      const res = await fetch('/__access/api/activate/' + encodeURIComponent(token));
       const data = await res.json();
 
       if (!res.ok) {
@@ -65,6 +65,7 @@
         $('eyebrow').textContent = 'Access link';
         $('title').textContent = 'Not available';
         $('message').textContent = data.error || 'This link could not be verified.';
+        $('countdown').textContent = '';
         $('countdownLabel').textContent = '';
         return;
       }
@@ -72,14 +73,15 @@
       setBadge('active', 'Active');
       $('eyebrow').textContent = 'Access link';
       $('title').textContent = 'Pass activated';
-      $('message').textContent = 'Your access window has started. Log in with the credentials from your email to continue.';
+      $('message').textContent = 'Your access window has started. Log in with the credentials from your email to reach the application.';
       startCountdown(data.expiresAt);
       $('continueBtn').style.display = 'block';
       $('continueBtn').addEventListener('click', () => {
-        window.location.href = '/login.html';
+        window.location.href = '/__access/login';
       });
     } catch (err) {
       setBadge('error', 'Error');
+      $('countdown').textContent = '';
       $('message').textContent = 'Could not reach the server. Check your connection and try again.';
     }
   }

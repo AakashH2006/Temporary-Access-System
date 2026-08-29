@@ -1,0 +1,63 @@
+# systemd unit for the temporary access gateway.
+#
+# Install as /etc/systemd/system/temp-access.service, then:
+#   systemctl daemon-reload
+#   systemctl enable --now temp-access
+#   journalctl -u temp-access -f
+
+[Unit]
+Description=Temporary access gateway
+Documentation=file:/opt/temp-access/README.md
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=tempaccess
+Group=tempaccess
+WorkingDirectory=/opt/temp-access
+
+# Secrets live here, root-owned and readable only by the service user:
+#   chown root:tempaccess /opt/temp-access/.env
+#   chmod 640 /opt/temp-access/.env
+EnvironmentFile=/opt/temp-access/.env
+Environment=NODE_ENV=production
+
+ExecStart=/usr/bin/node server.js
+
+# The gateway is the only way in for customers, so it should come back on its
+# own. A start-limit lets a genuinely broken config (bad DATABASE_URL, missing
+# JWT_SECRET) fail loudly instead of restarting forever.
+Restart=always
+RestartSec=3
+StartLimitBurst=5
+StartLimitIntervalSec=60
+
+# Graceful shutdown: server.close() drains in-flight proxied requests and
+# closes the Postgres pool before exit.
+KillSignal=SIGTERM
+TimeoutStopSec=20
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=temp-access
+
+# --- hardening ---
+# This process is internet-facing and holds a credential that reaches an
+# internal network, so it gets no more of the host than it needs.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/temp-access
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+[Install]
+WantedBy=multi-user.target

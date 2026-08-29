@@ -1,4 +1,4 @@
-﻿/* ---------- Temporary Access â€” shared design tokens ---------- */
+/* ---------- Temporary Access - shared design tokens ---------- */
 @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@500;600&display=swap');
 
 :root {
@@ -199,3 +199,106 @@ button.ghost:hover { border-color: var(--slate); }
 @media (prefers-reduced-motion: reduce) {
   * { transition: none !important; animation: none !important; }
 }
+/* ---------- Additions for the gateway ---------- */
+
+/* Wider stub for the admin console, which carries a grant table. */
+.ticket.wide { max-width: 860px; }
+
+/* Row of two fields side by side (email + duration). */
+.row { display: flex; gap: 12px; }
+.row > * { flex: 1; min-width: 0; }
+
+/* Credential readout shown after a grant is created. */
+.cred {
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 13px;
+  background: var(--paper-dim);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 10px 12px;
+  margin-top: 8px;
+  word-break: break-all;
+  user-select: all;
+}
+
+/* Grant table in the admin console. */
+table { width: 100%; border-collapse: collapse; margin-top: 8px; font-size: 13px; }
+th {
+  text-align: left;
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 10px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--slate);
+  font-weight: 600;
+  padding: 8px 10px 8px 0;
+  border-bottom: 1px solid var(--line);
+}
+td { padding: 10px 10px 10px 0; border-bottom: 1px solid var(--line); vertical-align: middle; }
+td.mono { font-family: 'IBM Plex Mono', monospace; font-size: 12px; }
+.table-scroll { overflow-x: auto; }
+
+/* Small inline revoke button inside a table row. */
+button.mini {
+  padding: 5px 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: transparent;
+  font-family: 'IBM Plex Sans', sans-serif;
+  font-size: 12px;
+  color: var(--rust);
+  cursor: pointer;
+  white-space: nowrap;
+}
+button.mini:hover { border-color: var(--rust); }
+button.mini:disabled { opacity: 0.35; cursor: not-allowed; }
+
+/* Fixed banner injected into every proxied page of the upstream app,
+   so the customer always sees how much of their window is left and can
+   end the session from anywhere inside the app. */
+#ta-banner {
+  position: fixed;
+  top: 0; left: 0; right: 0;
+  z-index: 2147483647;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 8px 16px;
+  background: var(--ink);
+  color: var(--paper);
+  font-family: 'IBM Plex Sans', sans-serif;
+  font-size: 13px;
+  box-shadow: 0 2px 12px rgba(0,0,0,0.35);
+}
+#ta-banner .t { font-family: 'IBM Plex Mono', monospace; font-weight: 600; font-variant-numeric: tabular-nums; }
+#ta-banner.warn { background: var(--rust); }
+#ta-banner button {
+  border: 1px solid rgba(255,255,255,0.35);
+  background: transparent;
+  color: inherit;
+  border-radius: 6px;
+  padding: 4px 12px;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+/* Signed-in-as row at the top of the admin console. */
+.whoami {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 12px;
+  margin-bottom: 8px;
+  background: var(--paper-dim);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  font-size: 13px;
+  color: var(--slate);
+}
+.whoami b { color: var(--ink); font-family: 'IBM Plex Mono', monospace; font-weight: 600; }
+
+/* Sign out is not destructive, so it shouldn't wear the revoke button's red. */
+button.mini.neutral { color: var(--slate); }
+button.mini.neutral:hover { border-color: var(--slate); }

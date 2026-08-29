@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Your access - Temporary Access</title>
+<link rel="stylesheet" href="/__access/styles.css" />
+</head>
+<body>
+  <div class="ticket">
+    <div class="ticket-head">
+      <div class="eyebrow" id="eyebrow">Checking session&hellip;</div>
+      <h1 id="title">Your access</h1>
+    </div>
+    <div class="perf"></div>
+
+    <div class="ticket-body" id="body" style="display:none">
+      <span class="badge active">Active</span>
+      <div class="countdown" id="countdown">&mdash;</div>
+      <div class="countdown-label">Access expires in</div>
+      <div class="stamp" id="emailStamp"></div>
+      <button class="primary" id="openBtn">Open the application</button>
+      <button class="ghost" id="logoutBtn">End session now</button>
+      <p class="muted" style="margin-top:16px">
+        Ending your session is permanent. These credentials will stop working
+        immediately, even if time remains on the clock.
+      </p>
+    </div>
+
+    <div class="ticket-body" id="deniedBody" style="display:none">
+      <span class="badge error">Denied</span>
+      <p class="muted" id="deniedMsg" style="margin-top:14px"></p>
+      <button class="primary" id="toLoginBtn">Go to login</button>
+    </div>
+  </div>
+
+<script>
+  const $ = (id) => document.getElementById(id);
+
+  function deny(message) {
+    $('eyebrow').textContent = 'Temporary Access';
+    $('title').textContent = 'Not authenticated';
+    $('body').style.display = 'none';
+    $('deniedBody').style.display = 'block';
+    $('deniedMsg').textContent = message;
+  }
+  $('toLoginBtn').addEventListener('click', () => {
+    window.location.href = '/__access/login';
+  });
+
+  function formatRemaining(sec) {
+    if (sec <= 0) return '00:00:00';
+    const h = String(Math.floor(sec / 3600)).padStart(2, '0');
+    const m = String(Math.floor((sec % 3600) / 60)).padStart(2, '0');
+    const s = String(Math.floor(sec % 60)).padStart(2, '0');
+    return h + ':' + m + ':' + s;
+  }
+
+  let remaining = 0;
+
+  // The server owns the clock. The local tick is only there to keep the
+  // digits moving between syncs, so a customer with a skewed system clock
+  // still sees the truth within a minute.
+  async function sync() {
+    const res = await fetch('/__access/api/session', { credentials: 'same-origin' });
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      deny(data.reason === 'revoked'
+        ? 'This access pass has been ended.'
+        : 'Your access window has ended.');
+      return false;
+    }
+    const data = await res.json();
+    remaining = data.remainingSeconds;
+    $('emailStamp').textContent = data.email;
+    return true;
+  }
+
+  async function load() {
+    try {
+      if (!(await sync())) return;
+    } catch (e) {
+      deny('Could not reach the server.');
+      return;
+    }
+
+    $('eyebrow').textContent = 'Temporary Access';
+    $('title').textContent = 'Your access';
+    $('body').style.display = 'block';
+
+    const tick = () => {
+      $('countdown').textContent = formatRemaining(remaining);
+      if (remaining <= 0) deny('Your access window has ended.');
+      remaining--;
+    };
+    tick();
+    setInterval(tick, 1000);
+    setInterval(() => sync().catch(() => {}), 60000);
+  }
+
+  // The app lives at the origin root; the gateway forwards it once the
+  // session cookie is in place.
+  $('openBtn').addEventListener('click', () => {
+    window.location.href = '/';
+  });
+
+  $('logoutBtn').addEventListener('click', async () => {
+    try {
+      await fetch('/__access/api/auth/logout', {
+        method: 'POST',
+        credentials: 'same-origin',
+      });
+    } catch (e) {
+      // Fall through to the login page regardless; the cookie is dead either
+      // way and the server is the one that decides.
+    }
+    window.location.href = '/__access/login';
+  });
+
+  load();
+</script>
+</body>
+</html>

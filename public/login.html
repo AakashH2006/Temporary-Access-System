@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Log in - Temporary Access</title>
+<link rel="stylesheet" href="/__access/styles.css" />
+</head>
+<body>
+  <div class="ticket">
+    <div class="ticket-head">
+      <div class="eyebrow">Temporary Access</div>
+      <h1>Log in</h1>
+    </div>
+    <div class="perf"></div>
+    <div class="ticket-body">
+      <p class="muted" id="reason">Use the email and temporary password from your access email.</p>
+
+      <form id="loginForm">
+        <label for="email">Email</label>
+        <input id="email" type="email" autocomplete="username" required />
+
+        <label for="password">Temporary password</label>
+        <input id="password" type="password" autocomplete="current-password" required />
+
+        <button class="primary" id="submitBtn" type="submit">Log in</button>
+      </form>
+      <div class="error-text" id="errorText"></div>
+    </div>
+  </div>
+
+<script>
+  const $ = (id) => document.getElementById(id);
+  const params = new URLSearchParams(location.search);
+
+  // Explain why they landed back here, when we know.
+  const REASONS = {
+    expired:        'Your access window has ended. Ask your contact for a new pass.',
+    revoked:        'This access pass has been ended and can no longer be used.',
+    not_active:     'This access pass is not active.',
+    session_expired:'Your login timed out. Log in again with the same credentials — '
+                    + 'you still have time left on your access window.',
+    bad_token:      'Your session could not be verified. Please log in again.',
+    grant_missing:  'This access pass no longer exists.',
+  };
+  const reason = params.get('reason');
+  if (reason && REASONS[reason]) {
+    $('reason').textContent = REASONS[reason];
+  }
+
+  // Only ever return to a path on this origin. Accepting an arbitrary
+  // "next" would turn the login page into an open redirect, which is a
+  // ready-made phishing tool given we send these links by email.
+  function safeNext() {
+    const next = params.get('next');
+    if (!next) return '/';
+    if (!next.startsWith('/') || next.startsWith('//')) return '/';
+    return next;
+  }
+
+  $('loginForm').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const btn = $('submitBtn');
+    const err = $('errorText');
+    err.classList.remove('show');
+    btn.disabled = true;
+    btn.textContent = 'Logging in...';
+
+    try {
+      const res = await fetch('/__access/api/auth/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        // The session arrives as an httpOnly cookie, so nothing is stored
+        // by this page and no token is reachable from JavaScript.
+        credentials: 'same-origin',
+        body: JSON.stringify({
+          email: $('email').value.trim(),
+          password: $('password').value,
+        }),
+      });
+      const data = await res.json();
+
+      if (!res.ok) {
+        err.textContent = data.error || 'Login failed.';
+        err.classList.add('show');
+        btn.disabled = false;
+        btn.textContent = 'Log in';
+        return;
+      }
+
+      window.location.href = safeNext();
+    } catch (e2) {
+      err.textContent = 'Could not reach the server.';
+      err.classList.add('show');
+      btn.disabled = false;
+      btn.textContent = 'Log in';
+    }
+  });
+</script>
+</body>
+</html>

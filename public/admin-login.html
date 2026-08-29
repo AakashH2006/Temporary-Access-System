@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Admin sign in - Temporary Access</title>
+<link rel="stylesheet" href="/__access/styles.css" />
+</head>
+<body>
+  <div class="ticket">
+    <div class="ticket-head">
+      <div class="eyebrow">Admin</div>
+      <h1>Sign in</h1>
+    </div>
+    <div class="perf"></div>
+    <div class="ticket-body">
+      <p class="muted" id="hint">
+        Admin accounts are created on the server with
+        <code>npm run create-admin</code>.
+      </p>
+
+      <form id="form">
+        <label for="email">Email</label>
+        <input id="email" type="email" autocomplete="username" required />
+
+        <label for="password">Password</label>
+        <input id="password" type="password" autocomplete="current-password" required />
+
+        <button class="primary" id="submitBtn" type="submit">Sign in</button>
+      </form>
+      <div class="error-text" id="errorText"></div>
+    </div>
+  </div>
+
+<script>
+  const $ = (id) => document.getElementById(id);
+
+  if (new URLSearchParams(location.search).get('reason') === 'expired') {
+    $('hint').textContent = 'Your admin session expired. Sign in again.';
+  }
+
+  $('form').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const btn = $('submitBtn');
+    const err = $('errorText');
+    err.classList.remove('show');
+    btn.disabled = true;
+    btn.textContent = 'Signing in...';
+
+    try {
+      const res = await fetch('/__access/api/admin/auth/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        // The session arrives as an httpOnly cookie. Nothing is kept in
+        // sessionStorage, so no credential is reachable from JavaScript.
+        credentials: 'same-origin',
+        body: JSON.stringify({
+          email: $('email').value.trim(),
+          password: $('password').value,
+        }),
+      });
+
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        // 429 is the rate limiter, which returns text rather than our JSON.
+        err.textContent = res.status === 429
+          ? 'Too many attempts. Wait a few minutes and try again.'
+          : (data.error || 'Sign in failed.');
+        err.classList.add('show');
+        btn.disabled = false;
+        btn.textContent = 'Sign in';
+        return;
+      }
+
+      window.location.href = '/__access/admin';
+    } catch (e2) {
+      err.textContent = 'Could not reach the server.';
+      err.classList.add('show');
+      btn.disabled = false;
+      btn.textContent = 'Sign in';
+    }
+  });
+</script>
+</body>
+</html>

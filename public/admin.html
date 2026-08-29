@@ -1,0 +1,271 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Access console - Admin</title>
+<link rel="stylesheet" href="/__access/styles.css" />
+</head>
+<body>
+  <div class="ticket wide" id="shell" style="display:none">
+    <div class="ticket-head">
+      <div class="eyebrow">Admin</div>
+      <h1>Access console</h1>
+    </div>
+    <div class="perf"></div>
+    <div class="ticket-body">
+
+      <div class="whoami">
+        <span>Signed in as <b id="whoEmail"></b></span>
+        <button class="mini neutral" id="signOut">Sign out</button>
+      </div>
+
+      <div class="row">
+        <div>
+          <label for="email">Customer email</label>
+          <input id="email" type="email" placeholder="customer@business.com" />
+        </div>
+        <div>
+          <label for="duration">Access duration</label>
+          <select id="duration">
+            <option value="1">1 hour</option>
+            <option value="4">4 hours</option>
+            <option value="8" selected>8 hours</option>
+            <option value="24">24 hours</option>
+            <option value="72">3 days</option>
+            <option value="168">7 days</option>
+          </select>
+        </div>
+      </div>
+
+      <button class="primary" id="submit">Grant access</button>
+      <div class="error-text" id="errorText"></div>
+
+      <div id="resultWrap" style="display:none; margin-top:20px">
+        <div class="kv"><span>Status</span><span id="rStatus">&mdash;</span></div>
+        <div class="kv"><span>Email</span><span id="rEmail">&mdash;</span></div>
+        <div class="cred" id="rUrl"></div>
+        <div id="rPasswordWrap" style="display:none">
+          <p class="muted" style="margin:12px 0 0">
+            The email did not send. Relay this password to the customer yourself
+            &mdash; it is shown once and is not recoverable.
+          </p>
+          <div class="cred" id="rPassword"></div>
+        </div>
+      </div>
+
+      <h1 style="font-size:16px;margin:32px 0 0">Recent grants</h1>
+      <p class="muted" id="listHint">Loading&hellip;</p>
+      <div class="table-scroll">
+        <table id="grantsTable" style="display:none">
+          <thead>
+            <tr>
+              <th>Email</th>
+              <th>Status</th>
+              <th>Activated</th>
+              <th>Expires</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody id="grantsBody"></tbody>
+        </table>
+      </div>
+
+    </div>
+  </div>
+
+<script>
+  const $ = (id) => document.getElementById(id);
+
+  // Every admin request carries the httpOnly session cookie. There is no key
+  // to hold, so nothing sensitive is reachable from this page's JavaScript.
+  const OPTS = { credentials: 'same-origin' };
+  const JSON_OPTS = { ...OPTS, headers: { 'Content-Type': 'application/json' } };
+
+  // `expired` is only truthful once the console has actually loaded with a
+  // working session. On a first visit there was never a session to expire,
+  // so the login page should not claim otherwise.
+  let consoleLoaded = false;
+  function toLogin() {
+    window.location.href = consoleLoaded
+      ? '/__access/admin-login?reason=expired'
+      : '/__access/admin-login';
+  }
+
+  // A 401 anywhere means the session died -- expired, signed out elsewhere, or
+  // the account was disabled. Bounce rather than showing a broken console.
+  async function api(path, opts = OPTS) {
+    const res = await fetch(path, opts);
+    if (res.status === 401) { toLogin(); throw new Error('unauthenticated'); }
+    return res;
+  }
+
+  function showError(msg) {
+    const err = $('errorText');
+    err.textContent = msg;
+    err.classList.add('show');
+  }
+
+  function fmtDate(iso) {
+    if (!iso) return '—';
+    return new Date(iso).toLocaleString(undefined, {
+      month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit',
+    });
+  }
+
+  const BADGE = { PENDING: 'pending', ACTIVE: 'active', EXPIRED: 'error', REVOKED: 'error' };
+
+  async function loadGrants() {
+    try {
+      const res = await api('/__access/api/admin/grants');
+      if (!res.ok) { $('listHint').textContent = 'Could not load grants.'; return; }
+
+      const { grants } = await res.json();
+      const body = $('grantsBody');
+      body.textContent = '';
+
+      if (!grants.length) {
+        $('listHint').textContent = 'No grants yet.';
+        $('grantsTable').style.display = 'none';
+        return;
+      }
+
+      $('listHint').textContent = '';
+      $('grantsTable').style.display = 'table';
+
+      const td = (text, cls) => {
+        const el = document.createElement('td');
+        el.textContent = text;
+        if (cls) el.className = cls;
+        return el;
+      };
+
+      for (const g of grants) {
+        const tr = document.createElement('tr');
+        tr.appendChild(td(g.email, 'mono'));
+
+        const statusTd = document.createElement('td');
+        const badge = document.createElement('span');
+        badge.className = 'badge ' + (BADGE[g.status] || 'pending');
+        badge.textContent = g.status;
+        statusTd.appendChild(badge);
+        tr.appendChild(statusTd);
+
+        tr.appendChild(td(fmtDate(g.activated_at), 'mono'));
+        tr.appendChild(td(fmtDate(g.expires_at), 'mono'));
+
+        const actionTd = document.createElement('td');
+        if (g.status === 'PENDING' || g.status === 'ACTIVE') {
+          const btn = document.createElement('button');
+          btn.className = 'mini';
+          btn.textContent = 'Revoke';
+          btn.addEventListener('click', () => revoke(g.id, btn));
+          actionTd.appendChild(btn);
+        }
+        tr.appendChild(actionTd);
+        body.appendChild(tr);
+      }
+    } catch (e) {
+      if (e.message !== 'unauthenticated') $('listHint').textContent = 'Could not reach the server.';
+    }
+  }
+
+  // No confirm() here: a browser modal blocks the page, and the action is
+  // cheap to redo by issuing a fresh grant.
+  async function revoke(id, btn) {
+    btn.disabled = true;
+    btn.textContent = 'Revoking...';
+    try {
+      const res = await api('/__access/api/admin/grants/' + id + '/revoke', { ...JSON_OPTS, method: 'POST' });
+      if (!res.ok) {
+        btn.disabled = false;
+        btn.textContent = 'Revoke';
+        showError('Revoke failed.');
+        return;
+      }
+      await loadGrants();
+    } catch (e) {
+      if (e.message === 'unauthenticated') return;
+      btn.disabled = false;
+      btn.textContent = 'Revoke';
+      showError('Could not reach the server.');
+    }
+  }
+
+  $('submit').addEventListener('click', async () => {
+    const btn = $('submit');
+    $('errorText').classList.remove('show');
+    $('resultWrap').style.display = 'none';
+    $('rPasswordWrap').style.display = 'none';
+    btn.disabled = true;
+    btn.textContent = 'Sending...';
+
+    try {
+      const res = await api('/__access/api/admin/grants', {
+        ...JSON_OPTS,
+        method: 'POST',
+        body: JSON.stringify({
+          email: $('email').value.trim(),
+          durationHours: Number($('duration').value),
+        }),
+      });
+      const data = await res.json();
+      btn.disabled = false;
+      btn.textContent = 'Grant access';
+
+      if (!res.ok && res.status !== 202) {
+        showError(data.error || 'Request failed.');
+        return;
+      }
+
+      $('resultWrap').style.display = 'block';
+      $('rEmail').textContent = data.grant.email;
+      $('rUrl').textContent = data.accessUrl;
+
+      if (data.warning) {
+        $('rStatus').textContent = 'Created, email failed';
+        $('rPasswordWrap').style.display = 'block';
+        $('rPassword').textContent = data.password;
+      } else {
+        $('rStatus').textContent = 'Sent';
+      }
+
+      $('email').value = '';
+      await loadGrants();
+    } catch (e) {
+      if (e.message === 'unauthenticated') return;
+      btn.disabled = false;
+      btn.textContent = 'Grant access';
+      showError('Could not reach the server.');
+    }
+  });
+
+  $('signOut').addEventListener('click', async () => {
+    try {
+      await fetch('/__access/api/admin/auth/logout', { ...JSON_OPTS, method: 'POST' });
+    } catch (e) {
+      // The cookie is dead server-side either way; the server decides.
+    }
+    window.location.href = '/__access/admin-login';
+  });
+
+  // Establish who we are before showing anything, so an unauthenticated
+  // visitor never sees the console chrome at all.
+  (async () => {
+    try {
+      const res = await api('/__access/api/admin/auth/me');
+      if (!res.ok) return toLogin();
+      const { email } = await res.json();
+      $('whoEmail').textContent = email;
+      $('shell').style.display = 'block';
+      consoleLoaded = true;
+      await loadGrants();
+    } catch (e) {
+      if (e.message !== 'unauthenticated') {
+        document.body.textContent = 'Could not reach the server.';
+      }
+    }
+  })();
+</script>
+</body>
+</html>
