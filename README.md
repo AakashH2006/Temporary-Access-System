@@ -102,10 +102,11 @@ subpath would break every absolute link the app emits.
 - **Backend:** Node.js 20+ / Express 5, single `server.js`
 - **Proxy:** `http-proxy-middleware`, with websocket support
 - **Database:** PostgreSQL
-- **Email:** Resend (HTTP API, no SDK)
+- **Email:** Resend or Amazon SES (HTTP APIs, no SDK)
 - **Auth:** bcrypt passwords (cost 12), JWT in an httpOnly cookie, separate
   admin accounts with per-account lockout
 - **Frontend:** plain HTML/CSS/JS, no build step
+- **Tests:** `node:test`, no framework and no test dependencies
 
 ## Project structure
 
@@ -119,8 +120,15 @@ public/                 the gate's own pages
   login.html            credential entry
   dashboard.html        countdown and entry to the app
   styles.css            shared design system
-demo-app/app.js         stand-in upstream, for testing without the real app
-scripts/create-admin.js the only way an admin account is created
+demo-app/app.js         stand-in upstream; also the reference implementation
+                        of the app-side shared-secret check
+test/
+  unit.test.js          pure functions; runs without a database
+  gateway.test.js       full request lifecycle against Postgres
+  helpers.js            fake upstream, cookie jar, fixtures
+scripts/
+  create-admin.js       the only way an admin account is created
+  prune-audit.js        audit-log retention, meant for cron
 deploy/
   nginx.conf            TLS termination and websocket upgrade
   temp-access.service   systemd unit
@@ -146,9 +154,9 @@ npm start            # gateway on :3000
 ```
 
 Then open `http://localhost:3000/__access/admin`, issue a grant to yourself,
-and follow the emailed link. Without a verified Resend domain the send will
-fail — that's expected, and the admin console shows the password on screen so
-you can carry on.
+and follow the emailed link. With no email provider configured the send fails
+— that's expected locally, and the admin console shows the password on screen
+so you can carry on.
 
 Point `UPSTREAM_URL` at the real application when you have one. Nothing else
 changes.
@@ -283,6 +291,50 @@ The same flow in a browser: sign in at `/__access/admin`, issue a grant, open
 the link from the email, and the app appears with a countdown bar pinned to the
 top of every one of its pages.
 
+## Tests
+
+```bash
+npm test
+```
+
+The unit tests run anywhere — they cover pure functions only, with no database
+and no listener. The integration tests need a Postgres, and are **skipped**
+rather than failed without one:
+
+```bash
+TEST_DATABASE_URL=postgres://user:pass@localhost:5432/temp_access_test npm test
+```
+
+Point that at a throwaway database: every test truncates all three tables and
+runs `schema.sql`, whose migrations rewrite rows. If creating a database is
+awkward, a schema inside an existing one works:
+
+```bash
+psql "$DATABASE_URL" -c 'CREATE SCHEMA ta_test'
+TEST_DATABASE_URL="...temp_access?options=-c%20search_path%3Dta_test,public" npm test
+```
+
+**Create that schema first.** Postgres silently ignores a `search_path` entry
+that does not exist, so a connection string naming a schema you never created
+falls straight back to `public` and the tests truncate the real tables while
+looking isolated. The harness refuses to run unless the database name contains
+`test` or `current_schema()` is not `public` — but the underlying trap is worth
+knowing about, because it is not specific to this repo.
+
+They start a real gateway on an ephemeral port with a stub upstream behind it,
+and the weight is on the moments the gateway says no, because that is the only
+thing it exists to do:
+
+- every rejection reason `resolveSession` can produce, including the one that
+  distinguishes an expired *window* from an expired *login*
+- the grant lifecycle, and revocation from each state it can be revoked in
+- an admin revoke reaching a customer who is already inside the app
+- login against a wrong password, an expired grant, a revoked grant, and a
+  differently-cased email
+- both lockouts: that they count, hold against the correct password, and release
+- that the reserved `/__access` namespace never falls through to the app
+- that the banner survives a strict upstream CSP, with a fresh nonce per response
+
 ## Admin authentication
 
 Whoever holds admin access can mint access to the internal network for anyone,
@@ -323,25 +375,52 @@ the password and clears any lockout.
 
 TOTP two-factor is scaffolded but not implemented: the `totp_secret` and
 `totp_enabled` columns exist and the login flow has the branch, so enabling it
-later is additive rather than a migration.
+later is additive rather than a migration. Because that branch can only return
+`501`, the database pins `totp_enabled` to `false` with a CHECK constraint —
+anything that set it (a well-meaning DBA, a migration run early) would lock
+that admin out permanently, with no recovery short of SQL. Implementing TOTP
+drops the constraint in the same change.
 
 ## Access grant lifecycle
 
 ```
-PENDING → ACTIVE → EXPIRED
-              │
-              └──────→ REVOKED   (admin revoke, or customer logout)
+PENDING ──opened──→ ACTIVE ──window ends──→ EXPIRED
+   │                  │
+   │                  └────→ REVOKED   (admin revoke, or customer logout)
+   │
+   └──never opened, 24h after creation──→ EXPIRED
 ```
 
-- **PENDING** — created, link not yet opened, clock not started.
+- **PENDING** — created, link not yet opened, access clock not started. Ages
+  out on its own after `PENDING_EXPIRY_HOURS`.
 - **ACTIVE** — link opened, clock running, login and proxying allowed.
-- **EXPIRED** — window closed. Decided server-side against `expires_at`.
+- **EXPIRED** — one of the two clocks ran out. Which one is recoverable from
+  the audit log: `GRANT_EXPIRED` means the access window closed,
+  `GRANT_LINK_EXPIRED` means the link was never opened. The customer is told
+  which, because only one of them means *you waited too long*.
 - **REVOKED** — admin revoked it, or the customer logged out. Permanent.
 
 ## Design notes
 
-- **The clock starts on activation, not creation.** A grant created at 10am
-  and opened at 4pm runs from 4pm.
+- **Three clocks, kept distinct.** Conflating any two of them produces a bug
+  that is very hard to recognise from a support ticket:
+
+  | Clock | Controlled by | Starts | Shipped value |
+  | --- | --- | --- | --- |
+  | Link validity | `PENDING_EXPIRY_HOURS` | grant creation | 24h |
+  | Access window | `durationHours` per grant, capped by `MAX_DURATION_HOURS` | activation | admin-chosen, max 24h |
+  | Login session | `SESSION_TTL_SECONDS`, capped at the grant's expiry | login | 1h |
+
+- **The access clock starts on activation, not creation.** A grant created at
+  10am and opened at 4pm runs from 4pm. The link's own clock, though, runs from
+  creation — an unopened link used to stay activatable indefinitely, which also
+  meant the credentials sitting in someone's inbox stayed live indefinitely.
+- **`MAX_DURATION_HOURS` is a ceiling, not a default.** There is no default
+  duration in the code; the admin names one on every grant and the check only
+  rejects values above the ceiling. 24 hours is a deliberate starting position
+  rather than a permanent constraint — a contractor on a two-week job would
+  need a fresh link daily under it, so it is worth asking a client for their
+  longest realistic access period. Raising it is a one-line change.
 - **Sessions live in an httpOnly cookie, not `sessionStorage`.** This is forced
   by the proxy: when the browser fetches the app's own stylesheets, scripts and
   XHRs it attaches cookies but never an `Authorization` header. A bearer-token
@@ -362,9 +441,32 @@ PENDING → ACTIVE → EXPIRED
   middleware entirely.
 - **Token vs. password.** The 9-digit token is an identifier, SHA-256 hashed
   for lookup. The password is a real credential, bcrypt cost 12.
-- **Failed logins are counted and audited**, and a login against a
-  non-existent grant still runs a bcrypt comparison, so response timing does
-  not reveal which emails have grants.
+- **Email is accepted, not delivered.** A provider returning `200` means it
+  took the message, not that anyone received it. The audit event is
+  `GRANT_EMAIL_ACCEPTED` and the console says *accepted for delivery*, because
+  a log that said "sent" would agree with the admin and disagree with reality.
+  Delivery webhooks would close the gap and are not on the plan; the answer to
+  a link that never arrived is **Revoke and reissue** in the console, which is
+  one action. No plaintext password is stored to re-send — reissuing generates
+  a new one, returns it for the admin to read out, and records
+  `GRANT_PASSWORD_RELAYED`, because a credential leaving by a second route is
+  exactly what an audit log should be able to answer for.
+- **Failed logins are counted, audited, and eventually lock the grant**, and a
+  login against a non-existent grant still runs a bcrypt comparison, so
+  response timing does not reveal which emails have grants. The lockout lives
+  in Postgres for the same reason the admin one does: it survives a restart,
+  and it catches an attempt spread across many IPs, which a per-IP limiter
+  cannot see at all. A locked-out customer is told they are locked out rather
+  than told their password is wrong — they are typing a generated password off
+  a screen, and the alternative is a support call.
+- **Emails are stored and compared lower-cased.** An admin who types
+  `Contractor@Firm.com` and a customer who types `contractor@firm.com` are the
+  same person, and any other answer produces a grant that cannot be used and a
+  rejection that reads as a wrong password.
+- **The injected banner carries a per-response CSP nonce**, added to the
+  upstream's own `script-src`/`style-src` rather than stripping the header.
+  An app with a strict CSP would otherwise silently drop the banner: no
+  countdown, no way to end the session, and nothing reporting a problem.
 - **A background sweeper** flips lapsed grants to `EXPIRED`, so the admin
   console doesn't show stale `ACTIVE` rows for windows that closed hours ago.
 - **Admin and customer sessions cannot be swapped.** Admin tokens are signed
@@ -375,6 +477,48 @@ PENDING → ACTIVE → EXPIRED
   the gateway does not define returns 404 instead of falling through to the
   proxy, so the app can never see or answer requests inside the one namespace
   this design promises it will never own.
+
+## Deliberate constraints
+
+**One instance.** `grantCache` is per-process and `express-rate-limit` uses its
+in-memory store, so both are correct for a single instance and quietly wrong
+for two: a revoke would lag on whichever instance did not handle it until the
+cache TTL expired, and every rate limit would divide per instance. This suits
+the deployment it is built for — one VM, co-located with the app it fronts —
+and it is a constraint rather than an oversight. Running more than one instance
+needs a shared cache (Redis) for grant status and a shared store for the rate
+limiters. Nothing else in the design is in the way.
+
+**At most one live grant per email address**, where live means `PENDING` or
+`ACTIVE`. Issuing a second one returns `409` with the existing grant's id,
+status and expiry, and the `uniq_live_grant_per_email` partial index enforces
+it under a race. Two live grants for one person cannot be told apart at login
+— a password can only be checked against one of them — so the older one would
+silently stop working, and its failed attempts would be counted against the
+wrong grant.
+
+The console offers **Revoke and reissue** as a single confirmed action, and
+says plainly that revoking ends any session in progress immediately. It is
+never automatic: auto-revoking would cut someone off mid-task to make room for
+a grant nobody had confirmed they wanted.
+
+**Audit retention is 12 months by default.** The log is append-only and the
+application never deletes from it; `npm run prune-audit` is the single
+exception, meant for cron, and it writes an `AUDIT_PRUNED` event of its own.
+Set `AUDIT_RETENTION_MONTHS` to whatever the client's policy actually says.
+
+```bash
+npm run prune-audit -- --dry-run     # count what would go
+npm run prune-audit -- --months=24
+```
+
+**Email is not a hard dependency.** Resend is what this runs on; its free tier
+(3,000/month, 100/day) covers the expected volume. SES is supported behind the
+same interface so the provider is a config-level swap rather than a rewrite —
+it is not a security improvement over Resend and is not treated as one. If a
+send fails outright, grant creation still returns `202` with the password in
+the body so the admin can relay it by hand: the grant is real either way, and
+losing it to an email outage would only mean issuing it again.
 
 ## Not handled (by design)
 
@@ -387,12 +531,30 @@ IP or browser (`ACTIVATE_REOPENED_FINGERPRINT_MISMATCH` in the audit log) but
 deliberately does not block it — customers roam between networks, and a false
 lockout is worse than a logged anomaly.
 
+Also out of scope, and worth saying plainly rather than leaving to be
+discovered:
+
+- **Multi-instance / horizontal scaling** — see the constraint above.
+- **Customer-side SSO or MFA.** The emailed password is the whole credential.
+- **Per-application or granular permissions.** One gateway fronts one upstream;
+  a grant is all-or-nothing within it.
+- **The upstream app's own security posture.** The gateway controls *who
+  reaches* the app and *for how long*. What the app does with a request is the
+  app's business, and a vulnerability inside it is not something a proxy in
+  front can fix.
+- **Proving the app is unreachable except through the gateway.**
+  `UPSTREAM_SHARED_SECRET` lets the app refuse anything that did not come via
+  the gateway, and the gateway warns at boot if `UPSTREAM_URL` looks public —
+  but the actual isolation is a network and DNS property of the deployment.
+  DEPLOY.md treats it as a required integration step, not a hardening tip.
+
 ## Extending later
 
 The schema already supports most of these without a migration:
 
 - Extending an active window
-- TOTP two-factor for admins (columns and login branch already in place)
+- TOTP two-factor for admins (columns and login branch already in place; the
+  `admins_totp_not_implemented` CHECK constraint comes off in the same change)
 - Multiple upstreams, with per-grant permissions
 - One-time (single-use) links
 - Per-grant path allowlists within the app

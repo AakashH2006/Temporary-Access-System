@@ -12,7 +12,9 @@
     "dev": "node --watch server.js",
     "demo-app": "node demo-app/app.js",
     "migrate": "psql \"$DATABASE_URL\" -f schema.sql",
-    "create-admin": "node scripts/create-admin.js"
+    "create-admin": "node scripts/create-admin.js",
+    "test": "node --test",
+    "prune-audit": "node scripts/prune-audit.js"
   },
   "dependencies": {
     "bcryptjs": "^3.0.3",

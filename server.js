@@ -2,6 +2,7 @@ require('dotenv').config();
 
 const path = require('path');
 const crypto = require('crypto');
+const dns = require('dns').promises;
 const express = require('express');
 const cookieParser = require('cookie-parser');
 const helmet = require('helmet');
@@ -41,12 +42,41 @@ const UPSTREAM_URL = process.env.UPSTREAM_URL;
 const COOKIE_NAME = 'ta_session';
 const COOKIE_SECURE = process.env.COOKIE_SECURE === 'true'
   || process.env.PUBLIC_BASE_URL.startsWith('https://');
+// Three independent clocks, and conflating any two of them produces a bug
+// that is very hard to see from a support ticket:
+//
+//   PENDING_EXPIRY_HOURS  the unopened link      runs from grant creation
+//   duration_seconds      the access window      runs from activation
+//   SESSION_TTL_SECONDS   one login              runs from login
+//
+// MAX_DURATION_HOURS is a ceiling on the second, not a default -- the admin
+// names a duration on every grant and this only rejects values above it.
 const SESSION_TTL_SECONDS = Number(process.env.SESSION_TTL_SECONDS || 3600);
 const MAX_DURATION_HOURS = Number(process.env.MAX_DURATION_HOURS || 24 * 30);
+
+// How long an unopened access link stays activatable. Without this a grant
+// created and never opened stayed live indefinitely -- next month, next year
+// -- and so did the credentials sitting in the customer's inbox.
+const PENDING_EXPIRY_HOURS = Number(process.env.PENDING_EXPIRY_HOURS || 24);
 const SWEEP_INTERVAL_MS = Number(process.env.SWEEP_INTERVAL_MS || 60_000);
 const GRANT_CACHE_TTL_MS = Number(process.env.GRANT_CACHE_TTL_MS || 5000);
 const INJECT_BANNER = process.env.INJECT_BANNER !== 'false';
 const STRIP_UPSTREAM_CSP = process.env.STRIP_UPSTREAM_CSP === 'true';
+
+// Customer-side lockout, mirroring the admin one. Deliberately its own pair of
+// knobs rather than reusing the admin numbers: a customer is retyping a
+// 16-character password read off a screen, so the threshold that is right for
+// an admin typing a password they chose themselves is wrong here.
+const GRANT_MAX_FAILED_ATTEMPTS = Number(process.env.GRANT_MAX_FAILED_ATTEMPTS || 8);
+const GRANT_LOCKOUT_MINUTES = Number(process.env.GRANT_LOCKOUT_MINUTES || 15);
+
+// Sent on every proxied request when set. The gateway's whole value rests on
+// the app being unreachable except through it, and nothing in this codebase
+// can enforce that -- but if the app rejects any request without this header,
+// a customer who finds the app's own address gets nothing. Optional, because
+// it needs a matching middleware on the app's side; see DEPLOY.md.
+const UPSTREAM_SHARED_SECRET = process.env.UPSTREAM_SHARED_SECRET || '';
+const UPSTREAM_SECRET_HEADER = process.env.UPSTREAM_SECRET_HEADER || 'X-Gateway-Secret';
 
 // ---- admin ----
 const ADMIN_COOKIE_NAME = 'ta_admin';
@@ -88,6 +118,16 @@ const pool = new Pool({
   ssl: process.env.DATABASE_SSL === 'true' ? { rejectUnauthorized: false } : false,
 });
 
+// `pg` emits 'error' on idle clients when a connection drops -- a Postgres
+// restart, a failover, an idle timeout on a managed instance. With no listener
+// Node treats that as an unhandled 'error' event and kills the process. On a
+// single-instance deployment where the gateway is the only route to the app,
+// that turns a database blip the pool would have recovered from on the next
+// checkout into a total outage for everyone using the gateway.
+pool.on('error', (err) => {
+  console.error('idle client error:', err.message);
+});
+
 // ============================================================
 // Crypto helpers
 // ============================================================
@@ -112,10 +152,55 @@ async function hashPassword(password) {
 }
 
 // ============================================================
+// Small helpers
+// ============================================================
+// Emails are stored and compared in exactly one form. Without this, an admin
+// who types `Contractor@Firm.com` creates a grant that `contractor@firm.com`
+// can never log into -- and the failure surfaces as "Invalid credentials",
+// which reads as a wrong password rather than a mistyped grant.
+function normaliseEmail(value) {
+  return String(value == null ? '' : value).trim().toLowerCase();
+}
+
+const HTML_ESCAPES = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
+
+function escapeHtml(value) {
+  return String(value == null ? '' : value).replace(/[&<>"']/g, (c) => HTML_ESCAPES[c]);
+}
+
+// Postgres throws 22P02 on a malformed UUID, which reaches the client as a
+// generic 500. Path parameters are shape-checked before they are ever put in a
+// query, so a bad id is a 404 -- which is the honest answer anyway.
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+function isUuid(value) {
+  return typeof value === 'string' && UUID_RE.test(value);
+}
+
+function hoursLabel(hours) {
+  return `${hours} hour${hours === 1 ? '' : 's'}`;
+}
+
+// ============================================================
 // Email
 // ============================================================
-async function sendAccessEmail({ to, accessUrl, username, password, durationLabel }) {
-  if (!process.env.RESEND_API_KEY) throw new Error('RESEND_API_KEY is not configured');
+// One message, two backends. Everything provider-specific lives behind
+// `send`, so nothing else in the codebase learns which one is in use and
+// adding a third is a function rather than a refactor.
+//
+// Resend is what this deploys on; its free tier covers the expected volume.
+// SES is here so the provider is a config-level swap rather than a rewrite if
+// that ever changes. It is not a security improvement over Resend and should
+// not be sold as one.
+const SES_KEYS = ['SES_REGION', 'SES_ACCESS_KEY_ID', 'SES_SECRET_ACCESS_KEY'];
+
+function renderAccessEmail({ accessUrl, username, password, durationLabel, linkExpiryLabel }) {
+  // Both clocks, spelled out. The old copy mentioned only that the countdown
+  // starts on opening, which left the customer with no idea the link itself
+  // has a deadline. Ambiguity here does not cause security incidents; it
+  // causes support calls, reliably.
+  const timing = `This link must be opened within ${linkExpiryLabel}.`
+    + ` Once you open it, your access lasts ${durationLabel}.`;
 
   const text = `Your temporary access has been created.
 
@@ -131,31 +216,146 @@ ${password}
 Access Duration:
 ${durationLabel}
 
-The countdown starts when you open the access URL, not now.`;
+${timing}`;
 
+  // Every interpolated value is escaped. `username` is an email an admin typed
+  // into a form, and an email regex accepts a great deal that is not an email
+  // -- this message goes out over the client's name, so it does not get to
+  // carry markup from a form field.
+  const e = escapeHtml;
   const html = `<p>Your temporary access has been created.</p>
-<p><b>Access URL:</b><br><a href="${accessUrl}">${accessUrl}</a></p>
-<p><b>Username:</b><br>${username}</p>
-<p><b>Temporary Password:</b><br><code>${password}</code></p>
-<p><b>Access Duration:</b><br>${durationLabel}</p>
-<p style="color:#6b7280;font-size:13px">The countdown starts when you open the access URL, not now.</p>`;
+<p><b>Access URL:</b><br><a href="${e(accessUrl)}">${e(accessUrl)}</a></p>
+<p><b>Username:</b><br>${e(username)}</p>
+<p><b>Temporary Password:</b><br><code>${e(password)}</code></p>
+<p><b>Access Duration:</b><br>${e(durationLabel)}</p>
+<p style="color:#6b7280;font-size:13px">${e(timing)}</p>`;
 
+  return { subject: 'Your temporary access', text, html };
+}
+
+async function sendViaResend({ to, subject, text, html }) {
   const res = await fetch('https://api.resend.com/emails', {
     method: 'POST',
     headers: {
       Authorization: `Bearer ${process.env.RESEND_API_KEY}`,
       'Content-Type': 'application/json',
     },
-    body: JSON.stringify({
-      from: process.env.EMAIL_FROM,
-      to,
-      subject: 'Your temporary access',
-      text,
-      html,
-    }),
+    body: JSON.stringify({ from: process.env.EMAIL_FROM, to, subject, text, html }),
   });
   if (!res.ok) throw new Error(`Email send failed: ${res.status} ${await res.text()}`);
   return res.json();
+}
+
+// SigV4, signed by hand rather than pulling in the AWS SDK. One request to one
+// endpoint does not justify ~20MB of dependency, and the signing steps below
+// are the whole of what the SDK would do for this call.
+function sha256Hex(value) {
+  return crypto.createHash('sha256').update(value, 'utf8').digest('hex');
+}
+function hmac(key, value) {
+  return crypto.createHmac('sha256', key).update(value, 'utf8').digest();
+}
+
+async function sendViaSes({ to, subject, text, html }) {
+  const region = process.env.SES_REGION;
+  const host = `email.${region}.amazonaws.com`;
+  const canonicalUri = '/v2/email/outbound-emails';
+  const body = JSON.stringify({
+    FromEmailAddress: process.env.EMAIL_FROM,
+    Destination: { ToAddresses: [to] },
+    Content: {
+      Simple: {
+        Subject: { Data: subject, Charset: 'UTF-8' },
+        Body: {
+          Text: { Data: text, Charset: 'UTF-8' },
+          Html: { Data: html, Charset: 'UTF-8' },
+        },
+      },
+    },
+  });
+
+  const amzDate = new Date().toISOString().replace(/[:-]|\.\d{3}/g, ''); // 20240101T000000Z
+  const dateStamp = amzDate.slice(0, 8);
+  const payloadHash = sha256Hex(body);
+
+  const signedHeaders = 'content-type;host;x-amz-content-sha256;x-amz-date';
+  const canonicalHeaders = `content-type:application/json\n`
+    + `host:${host}\n`
+    + `x-amz-content-sha256:${payloadHash}\n`
+    + `x-amz-date:${amzDate}\n`;
+  const canonicalRequest = ['POST', canonicalUri, '', canonicalHeaders, signedHeaders, payloadHash].join('\n');
+
+  const scope = `${dateStamp}/${region}/ses/aws4_request`;
+  const stringToSign = ['AWS4-HMAC-SHA256', amzDate, scope, sha256Hex(canonicalRequest)].join('\n');
+
+  const signingKey = hmac(
+    hmac(hmac(hmac(`AWS4${process.env.SES_SECRET_ACCESS_KEY}`, dateStamp), region), 'ses'),
+    'aws4_request'
+  );
+  const signature = crypto.createHmac('sha256', signingKey).update(stringToSign, 'utf8').digest('hex');
+
+  const res = await fetch(`https://${host}${canonicalUri}`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Host: host,
+      'X-Amz-Content-Sha256': payloadHash,
+      'X-Amz-Date': amzDate,
+      Authorization: `AWS4-HMAC-SHA256 Credential=${process.env.SES_ACCESS_KEY_ID}/${scope}, `
+        + `SignedHeaders=${signedHeaders}, Signature=${signature}`,
+    },
+    body,
+  });
+  if (!res.ok) throw new Error(`Email send failed: ${res.status} ${await res.text()}`);
+  return res.json();
+}
+
+// Explicit when EMAIL_PROVIDER is set, inferred from whichever credentials
+// exist otherwise -- so an existing Resend deployment keeps working with no
+// config change at all.
+function resolveEmailProvider() {
+  const resend = {
+    name: 'resend',
+    send: sendViaResend,
+    ready: Boolean(process.env.RESEND_API_KEY),
+    missing: 'RESEND_API_KEY',
+  };
+  const ses = {
+    name: 'ses',
+    send: sendViaSes,
+    ready: SES_KEYS.every((k) => process.env[k]),
+    missing: SES_KEYS.filter((k) => !process.env[k]).join(', '),
+  };
+
+  const named = (process.env.EMAIL_PROVIDER || '').trim().toLowerCase();
+  if (named === 'resend') return resend;
+  if (named === 'ses') return ses;
+  if (named) {
+    return {
+      name: named,
+      send: null,
+      ready: false,
+      missing: `EMAIL_PROVIDER="${named}" is not a known provider (use "resend" or "ses")`,
+    };
+  }
+
+  if (resend.ready) return resend;
+  if (ses.ready) return ses;
+  return {
+    name: 'none',
+    send: null,
+    ready: false,
+    missing: 'RESEND_API_KEY, or all of ' + SES_KEYS.join(', '),
+  };
+}
+
+async function sendAccessEmail({ to, ...message }) {
+  const provider = resolveEmailProvider();
+  if (!provider.ready) throw new Error(`Email is not configured: missing ${provider.missing}`);
+  if (!process.env.EMAIL_FROM) throw new Error('EMAIL_FROM is not configured');
+  // Passed through rather than re-destructured: naming the fields twice means
+  // adding one to the message silently drops it here.
+  return provider.send({ to, ...renderAccessEmail(message) });
 }
 
 // ============================================================
@@ -192,6 +392,18 @@ const grantCache = new Map();
 
 function cacheBust(grantId) {
   grantCache.delete(grantId);
+}
+
+// The TTL is only checked on read, so an entry that is never read again is
+// never removed: one entry per grant this process has ever proxied, held for
+// the life of a process meant to run for months. The sweeper bounds it by
+// dropping everything already past the TTL, which by definition cannot be
+// serving a cache hit to anyone.
+function sweepGrantCache() {
+  const cutoff = Date.now() - GRANT_CACHE_TTL_MS;
+  for (const [id, entry] of grantCache) {
+    if (entry.at < cutoff) grantCache.delete(id);
+  }
 }
 
 async function loadGrant(grantId) {
@@ -418,7 +630,24 @@ app.use(GATE, helmet({
 const gateLimiter = rateLimit({ windowMs: 60_000, max: 300 });
 const createLimiter = rateLimit({ windowMs: 60_000, max: 20 });
 const activateLimiter = rateLimit({ windowMs: 60_000, max: 30 });
-const loginLimiter = rateLimit({ windowMs: 60_000, max: 10 });
+// Per IP, in memory. The per-grant lockout in the login handler is the other
+// half of this pair, for the same reason it is on the admin side: this limiter
+// stops one source hammering, and the database lockout is what catches an
+// attempt spread across many addresses, which a per-IP counter cannot see at
+// all. Keep it looser than GRANT_MAX_FAILED_ATTEMPTS so a single-source attack
+// still reaches the lockout and produces an audited GRANT_LOCKED event rather
+// than an opaque 429.
+const loginLimiter = rateLimit({
+  windowMs: Number(process.env.LOGIN_RATE_WINDOW_MINUTES || 1) * 60_000,
+  max: Number(process.env.LOGIN_RATE_MAX || 10),
+  // JSON, because the login page parses the body to show the message. The
+  // library's plain-text default reaches the customer as "Could not reach the
+  // server", which sends them looking for the wrong problem.
+  handler: (_req, res) => res.status(429).json({
+    error: 'Too many attempts. Wait a minute and try again.',
+    reason: 'rate_limited',
+  }),
+});
 // Two different controls guard admin sign-in, and they are deliberately not
 // the same number:
 //
@@ -468,7 +697,16 @@ app.get(`${GATE}/link/:token`, (req, res) => {
 // ============================================================
 // Gate API -- admin authentication
 // ============================================================
-const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+// Stricter than "contains an @", and length-capped. The loose version happily
+// accepted `<img src=x onerror=...>@evil.com`, which then went into the HTML
+// of an email sent over the client's name. That value is escaped at render
+// time now; this is the cheaper half of the same fix -- refuse it at the door.
+const MAX_EMAIL_LENGTH = 254;
+const EMAIL_RE = /^[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}$/;
+
+function isValidEmail(value) {
+  return typeof value === 'string' && value.length <= MAX_EMAIL_LENGTH && EMAIL_RE.test(value);
+}
 
 app.post(`${GATE}/api/admin/auth/login`, adminIpAllowlist, adminLoginLimiter, async (req, res) => {
   const { email, password } = req.body || {};
@@ -526,6 +764,11 @@ app.post(`${GATE}/api/admin/auth/login`, adminIpAllowlist, adminLoginLimiter, as
 
   // TOTP hook. The columns and this branch exist so enabling two-factor later
   // is a feature flag rather than a migration; nothing verifies a code yet.
+  //
+  // Unreachable by construction: schema.sql carries a CHECK constraint pinning
+  // totp_enabled to false, because this branch locks an admin out permanently
+  // with no recovery short of SQL. The database refuses the one state the code
+  // cannot handle; drop the constraint in the same change that implements TOTP.
   if (admin.totp_enabled) {
     return res.status(501).json({ error: 'Two-factor is enabled for this account but not yet implemented' });
   }
@@ -556,8 +799,15 @@ app.post(`${GATE}/api/admin/auth/logout`, adminOnly, async (req, res) => {
   res.json({ message: 'Signed out.' });
 });
 
+// Also carries the two limits the console needs to render honestly: it should
+// not offer a duration the server will reject, and it should be able to tell
+// an admin how long the link they are about to send stays openable.
 app.get(`${GATE}/api/admin/auth/me`, adminOnly, (req, res) => {
-  res.json({ email: req.admin.email });
+  res.json({
+    email: req.admin.email,
+    maxDurationHours: MAX_DURATION_HOURS,
+    pendingExpiryHours: PENDING_EXPIRY_HOURS,
+  });
 });
 
 // ============================================================
@@ -565,12 +815,47 @@ app.get(`${GATE}/api/admin/auth/me`, adminOnly, (req, res) => {
 // ============================================================
 
 app.post(`${GATE}/api/admin/grants`, adminOnly, createLimiter, async (req, res) => {
-  const { email, durationHours } = req.body || {};
-  if (!email || !EMAIL_RE.test(email)) return res.status(400).json({ error: 'Valid email required' });
+  const { durationHours, relay } = req.body || {};
+  // Normalised before it is stored, because login normalises before it looks
+  // up. Storing what the admin typed and matching on it exactly is what made a
+  // mixed-case address create a grant nobody could use.
+  const email = normaliseEmail(req.body?.email);
+  if (!isValidEmail(email)) return res.status(400).json({ error: 'Valid email required' });
 
   const hours = Number(durationHours);
   if (!Number.isFinite(hours) || hours <= 0 || hours > MAX_DURATION_HOURS) {
     return res.status(400).json({ error: `durationHours must be > 0 and <= ${MAX_DURATION_HOURS}` });
+  }
+
+  // The invariant: at most one LIVE grant per email, where live means PENDING
+  // or ACTIVE. Two concurrent live grants used to be accepted silently and
+  // then half-work -- login reads the newest row only, so the older grant's
+  // password (entirely valid, freshly emailed) failed against the newer
+  // grant's hash, and the failure was counted against the wrong grant.
+  //
+  // uniq_live_grant_per_email is the enforcement; this lookup exists to give
+  // the console something useful to say, including which grant is in the way.
+  const live = await pool.query(
+    `SELECT id, status, expires_at FROM access_grants
+     WHERE email = $1 AND status IN ('PENDING','ACTIVE')
+     ORDER BY created_at DESC LIMIT 1`,
+    [email]
+  );
+  if (live.rows[0]) {
+    await audit(req, {
+      grantId: live.rows[0].id,
+      event: 'GRANT_CREATE_REJECTED',
+      actor: req.admin.email,
+      detail: { reason: 'live_grant_exists', email },
+    });
+    return res.status(409).json({
+      error: 'This person already has a live grant. Revoke it before issuing a new one.',
+      existingGrant: {
+        id: live.rows[0].id,
+        status: live.rows[0].status,
+        expiresAt: live.rows[0].expires_at,
+      },
+    });
   }
 
   const token = generateToken();
@@ -586,6 +871,15 @@ app.post(`${GATE}/api/admin/grants`, adminOnly, createLimiter, async (req, res) 
     );
     grant = rows[0];
   } catch (err) {
+    // Two admins issuing to the same person at the same moment lose the race
+    // here rather than at the check above. Told apart by constraint name --
+    // the other 23505 in this route is a token collision, which means
+    // something entirely different to the admin reading the message.
+    if (err.code === '23505' && err.constraint === 'uniq_live_grant_per_email') {
+      return res.status(409).json({
+        error: 'This person already has a live grant. Revoke it before issuing a new one.',
+      });
+    }
     if (err.code === '23505') return res.status(409).json({ error: 'Token collision, please retry' });
     throw err;
   }
@@ -598,14 +892,21 @@ app.post(`${GATE}/api/admin/grants`, adminOnly, createLimiter, async (req, res) 
   });
 
   const accessUrl = `${process.env.PUBLIC_BASE_URL}${GATE}/link/${token}`;
-  const durationLabel = `${hours} hour${hours === 1 ? '' : 's'}`;
+  const durationLabel = hoursLabel(hours);
   const payload = {
     grant: { id: grant.id, email: grant.email, status: grant.status, createdAt: grant.created_at },
     accessUrl,
   };
 
   try {
-    await sendAccessEmail({ to: email, accessUrl, username: email, password, durationLabel });
+    await sendAccessEmail({
+      to: email,
+      accessUrl,
+      username: email,
+      password,
+      durationLabel,
+      linkExpiryLabel: hoursLabel(PENDING_EXPIRY_HOURS),
+    });
   } catch (err) {
     await audit(req, {
       grantId: grant.id,
@@ -624,19 +925,64 @@ app.post(`${GATE}/api/admin/grants`, adminOnly, createLimiter, async (req, res) 
     });
   }
 
-  await audit(req, { grantId: grant.id, event: 'GRANT_EMAIL_SENT', actor: req.admin.email });
+  // ACCEPTED, not SENT. A 200 from the provider means it took the message,
+  // not that anyone received it -- a later bounce or spam-filter drop is
+  // invisible here, and an audit trail that says "sent" would agree with the
+  // admin and disagree with reality. Webhooks would close the gap and are not
+  // on the plan; naming the event honestly is the next best thing.
+  await audit(req, { grantId: grant.id, event: 'GRANT_EMAIL_ACCEPTED', actor: req.admin.email });
+
+  // Opt-in, because the admin asked to read the password out rather than rely
+  // on the email -- the reissue path, usually, after a message that was
+  // accepted and never arrived. It is not returned by default: the password
+  // has no business being in a response body, a browser tab or a screen
+  // recording unless someone deliberately needs it there.
+  //
+  // Audited as its own event. A credential leaving the system by a second
+  // route is exactly the kind of thing the log should be able to answer for.
+  if (relay) {
+    await audit(req, {
+      grantId: grant.id,
+      event: 'GRANT_PASSWORD_RELAYED',
+      actor: req.admin.email,
+      detail: { reason: 'admin_requested_manual_relay' },
+    });
+    return res.status(201).json({ ...payload, password });
+  }
+
   res.status(201).json(payload);
 });
 
 app.get(`${GATE}/api/admin/grants`, adminOnly, async (_req, res) => {
   const { rows } = await pool.query(
-    `SELECT id, email, status, created_at, activated_at, expires_at, activated_ip
+    `SELECT id, email, status, created_at, activated_at, expires_at, activated_ip,
+            duration_seconds
      FROM access_grants ORDER BY created_at DESC LIMIT 100`
   );
   res.json({ grants: rows });
 });
 
+// Powers the console's check before the admin submits, so a collision with an
+// existing live grant is visible up front rather than as an error afterwards.
+// Deliberately not a general search: it answers one question about one address.
+app.get(`${GATE}/api/admin/grants/live`, adminOnly, async (req, res) => {
+  const email = normaliseEmail(req.query.email);
+  if (!isValidEmail(email)) return res.status(400).json({ error: 'Valid email required' });
+
+  const { rows } = await pool.query(
+    `SELECT id, email, status, created_at, expires_at, duration_seconds
+     FROM access_grants WHERE email = $1 AND status IN ('PENDING','ACTIVE')
+     ORDER BY created_at DESC LIMIT 1`,
+    [email]
+  );
+  res.json({ grant: rows[0] || null });
+});
+
 app.post(`${GATE}/api/admin/grants/:id/revoke`, adminOnly, async (req, res) => {
+  // A malformed id is a 404, not a 500: an id that cannot exist is a grant
+  // that does not exist, and Postgres should never see the value at all.
+  if (!isUuid(req.params.id)) return res.status(404).json({ error: 'Grant not found or not revocable' });
+
   const { rows } = await pool.query(
     `UPDATE access_grants SET status = 'REVOKED'
      WHERE id = $1 AND status IN ('PENDING','ACTIVE') RETURNING id, status`,
@@ -657,6 +1003,10 @@ app.post(`${GATE}/api/admin/grants/:id/revoke`, adminOnly, async (req, res) => {
 app.get(`${GATE}/api/admin/audit-log`, adminOnly, async (req, res) => {
   const limit = Math.min(Number(req.query.limit) || 200, 1000);
   const { grantId } = req.query;
+  // Same reasoning as revoke: this reaches a UUID column, so it is shape-checked.
+  if (grantId !== undefined && !isUuid(grantId)) {
+    return res.status(400).json({ error: 'grantId must be a UUID' });
+  }
   const { rows } = grantId
     ? await pool.query(
         'SELECT * FROM audit_log WHERE grant_id = $1 ORDER BY created_at DESC LIMIT $2',
@@ -684,6 +1034,26 @@ app.get(`${GATE}/api/activate/:token`, activateLimiter, async (req, res) => {
   }
 
   if (grant.status === 'PENDING') {
+    // The link's own clock, which is not the access window. Checked here and
+    // not left to the sweeper alone: the sweeper runs on an interval, and a
+    // link opened between two sweeps would otherwise activate normally.
+    const ageHours = (Date.now() - new Date(grant.created_at).getTime()) / 3_600_000;
+    if (ageHours > PENDING_EXPIRY_HOURS) {
+      await pool.query("UPDATE access_grants SET status = 'EXPIRED' WHERE id = $1", [grant.id]);
+      cacheBust(grant.id);
+      await audit(req, {
+        grantId: grant.id,
+        event: 'GRANT_LINK_EXPIRED',
+        actor: grant.email,
+        detail: { reason: 'opened_after_link_expiry', linkExpiryHours: PENDING_EXPIRY_HOURS },
+      });
+      return res.status(410).json({
+        error: `This access link expired. Links must be opened within ${hoursLabel(PENDING_EXPIRY_HOURS)}`
+          + ' of being issued. Ask your contact for a new one.',
+        reason: 'link_expired',
+      });
+    }
+
     const now = new Date();
     const expiresAt = new Date(now.getTime() + grant.duration_seconds * 1000);
     await pool.query(
@@ -708,7 +1078,7 @@ app.get(`${GATE}/api/activate/:token`, activateLimiter, async (req, res) => {
       await pool.query("UPDATE access_grants SET status = 'EXPIRED' WHERE id = $1", [grant.id]);
       cacheBust(grant.id);
       await audit(req, { grantId: grant.id, event: 'GRANT_EXPIRED', actor: 'system' });
-      return res.status(410).json({ error: 'This access link has expired' });
+      return res.status(410).json({ error: 'This access link has expired', reason: 'expired' });
     }
     // Reopening an active link is usually innocent -- a refresh, or checking
     // the time left -- so it isn't blocked. But an open from a different IP or
@@ -731,7 +1101,22 @@ app.get(`${GATE}/api/activate/:token`, activateLimiter, async (req, res) => {
     actor: grant.email,
     detail: { status: grant.status },
   });
-  res.status(410).json({ error: 'This access link is no longer valid' });
+
+  // A grant that reached EXPIRED without ever being activated is a link that
+  // ran out, not a window that did -- almost always because the sweeper got
+  // to it first. The customer needs to be told which of the two happened,
+  // because only one of them means "you waited too long".
+  if (grant.status === 'EXPIRED' && !grant.activated_at) {
+    return res.status(410).json({
+      error: `This access link expired. Links must be opened within ${hoursLabel(PENDING_EXPIRY_HOURS)}`
+        + ' of being issued. Ask your contact for a new one.',
+      reason: 'link_expired',
+    });
+  }
+  res.status(410).json({
+    error: 'This access link is no longer valid',
+    reason: grant.status === 'REVOKED' ? 'revoked' : 'not_valid',
+  });
 });
 
 // A bcrypt hash of a value nobody can supply. Comparing against it burns the
@@ -740,9 +1125,15 @@ app.get(`${GATE}/api/activate/:token`, activateLimiter, async (req, res) => {
 const DUMMY_HASH = '$2b$12$C6UzMDM.H6dfI/f/IKcEe.mB1TUpU4A1r9Ea3q2Ao8mwrLIfBSbLC';
 
 app.post(`${GATE}/api/auth/login`, loginLimiter, async (req, res) => {
-  const { email, password } = req.body || {};
+  const { password } = req.body || {};
+  // Normalised to match how grants are stored. Before this, a grant issued to
+  // `Contractor@Firm.com` was invisible to the person typing their own address
+  // in lower case, and the rejection was indistinguishable from a bad password.
+  const email = normaliseEmail(req.body?.email);
   if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
 
+  // At most one PENDING/ACTIVE grant per email exists -- enforced at creation
+  // and by a partial unique index -- so this row is unambiguous.
   const { rows } = await pool.query(
     `SELECT * FROM access_grants WHERE email = $1 AND status = 'ACTIVE'
      ORDER BY created_at DESC LIMIT 1`,
@@ -763,17 +1154,57 @@ app.post(`${GATE}/api/auth/login`, loginLimiter, async (req, res) => {
     return res.status(401).json({ error: 'Access expired' });
   }
 
+  // Checked before the password, exactly as the admin lockout is: a locked
+  // grant stays locked even when the right password finally arrives, which is
+  // the whole point of a lockout. Unlike the admin path this one says what has
+  // happened -- a customer retyping a 16-character password off a screen needs
+  // to know they are locked out rather than wrong, or they call someone.
+  if (grant.locked_until && new Date(grant.locked_until) > new Date()) {
+    await bcrypt.compare(password, DUMMY_HASH);
+    const minutes = Math.max(1, Math.ceil((new Date(grant.locked_until) - Date.now()) / 60000));
+    await audit(req, {
+      grantId: grant.id,
+      event: 'LOGIN_FAILED',
+      actor: email,
+      detail: { reason: 'locked' },
+    });
+    return res.status(429).json({
+      error: `Too many failed attempts. Try again in ${minutes} minute${minutes === 1 ? '' : 's'}.`,
+      reason: 'locked',
+    });
+  }
+
   if (!(await bcrypt.compare(password, grant.password_hash))) {
+    // The counter was written and never read before this: the column looked
+    // like a control during a security review and was not one. It locks now,
+    // mirroring the admin path -- persisted in Postgres so it survives a
+    // restart, where the per-IP limiter (in memory, per process) does not.
+    const attempts = grant.failed_login_attempts + 1;
+    const lock = attempts >= GRANT_MAX_FAILED_ATTEMPTS;
     await pool.query(
-      'UPDATE access_grants SET failed_login_attempts = failed_login_attempts + 1 WHERE id = $1',
-      [grant.id]
+      `UPDATE access_grants SET failed_login_attempts = $1,
+              locked_until = CASE WHEN $2 THEN now() + ($3 || ' minutes')::interval ELSE locked_until END
+       WHERE id = $4`,
+      [lock ? 0 : attempts, lock, String(GRANT_LOCKOUT_MINUTES), grant.id]
     );
     await audit(req, {
       grantId: grant.id,
       event: 'LOGIN_FAILED',
       actor: email,
-      detail: { reason: 'bad_password' },
+      detail: { reason: 'bad_password', attempts },
     });
+    if (lock) {
+      await audit(req, {
+        grantId: grant.id,
+        event: 'GRANT_LOCKED',
+        actor: email,
+        detail: { minutes: GRANT_LOCKOUT_MINUTES, afterAttempts: GRANT_MAX_FAILED_ATTEMPTS },
+      });
+      return res.status(429).json({
+        error: `Too many failed attempts. Try again in ${GRANT_LOCKOUT_MINUTES} minutes.`,
+        reason: 'locked',
+      });
+    }
     return res.status(401).json({ error: 'Invalid credentials' });
   }
 
@@ -788,7 +1219,10 @@ app.post(`${GATE}/api/auth/login`, loginLimiter, async (req, res) => {
     { expiresIn: expiresInSeconds }
   );
 
-  await pool.query('UPDATE access_grants SET failed_login_attempts = 0 WHERE id = $1', [grant.id]);
+  await pool.query(
+    'UPDATE access_grants SET failed_login_attempts = 0, locked_until = NULL WHERE id = $1',
+    [grant.id]
+  );
   await audit(req, {
     grantId: grant.id,
     event: 'LOGIN_SUCCESS',
@@ -848,9 +1282,17 @@ app.use(GATE, (_req, res) => res.status(404).json({ error: 'Not found' }));
 // Injected into every HTML document the upstream app returns, so the customer
 // always sees the time left and can end the session from anywhere inside the
 // app rather than having to find their way back to the dashboard.
-const bannerScript = `
-<script>(function(){
+//
+// Takes a per-response nonce so it survives a strict upstream CSP. Without one
+// the browser silently drops the script: no countdown, no way to end the
+// session, and nothing reporting a problem anywhere.
+function bannerScript(nonce) {
+  const attr = nonce ? ` nonce="${nonce}"` : '';
+  const nonceLiteral = JSON.stringify(nonce || '');
+  return `
+<script${attr}>(function(){
   if (window.top !== window.self) return;
+  var NONCE = ${nonceLiteral};
   var bar = document.createElement('div');
   bar.id = 'ta-banner';
   bar.innerHTML = '<span>Temporary access &mdash; <span class="t">--:--:--</span> remaining</span>';
@@ -863,6 +1305,10 @@ const bannerScript = `
   bar.appendChild(btn);
 
   var css = document.createElement('style');
+  // A style element inserted by script is still governed by style-src, so it
+  // needs the nonce too -- otherwise the banner appears unstyled rather than
+  // not at all, which is arguably worse.
+  if (NONCE) css.setAttribute('nonce', NONCE);
   css.textContent = '#ta-banner{position:fixed;top:0;left:0;right:0;z-index:2147483647;display:flex;'
     + 'align-items:center;justify-content:space-between;gap:16px;padding:8px 16px;background:#12151c;'
     + 'color:#f7f4ec;font-family:system-ui,sans-serif;font-size:13px;box-shadow:0 2px 12px rgba(0,0,0,.35)}'
@@ -899,6 +1345,63 @@ const bannerScript = `
   setInterval(paint, 1000);
   setInterval(sync, 60000);
 })();</script>`;
+}
+
+// Rewrites an upstream CSP so the banner runs, without taking the app's own
+// policy away from it. STRIP_UPSTREAM_CSP -- deleting the header outright --
+// remains as the escape hatch, but trading an app's CSP for a countdown bar is
+// a bad deal, and this is the version that does not make it.
+//
+// Three narrow changes, and nothing else in the policy is touched:
+//   - the nonce is added to whichever script directives exist;
+//   - and to the style ones, since the banner inserts a <style> element;
+//   - connect-src gains 'self', because the countdown re-syncs against the
+//     gateway's own /api/session and a nonce cannot authorise a fetch.
+function relaxCspForBanner(csp, nonce) {
+  if (!csp) return csp;
+
+  const directives = csp.split(/;/).map((d) => d.trim()).filter(Boolean);
+  const nameOf = (d) => d.split(/\s+/)[0].toLowerCase();
+  const sourcesOf = (d) => d.split(/\s+/).slice(1);
+  const present = new Set(directives.map(nameOf));
+  const defaultSrc = directives.find((d) => nameOf(d) === 'default-src');
+
+  // Appending to a source list drops 'none'. A list is either 'none' or a set
+  // of sources -- never both -- and a policy that says both is only honoured
+  // because browsers parse leniently, which is not something to rely on.
+  const add = (directive, ...sources) => {
+    const parts = directive.split(/\s+/).filter((p) => p.toLowerCase() !== "'none'");
+    for (const source of sources) if (!parts.includes(source)) parts.push(source);
+    return parts.join(' ');
+  };
+  const rename = (directive, name) => [name, ...sourcesOf(directive)].join(' ');
+  const allowsSelf = (directive) => sourcesOf(directive).includes("'self'");
+
+  const NONCED = ['script-src', 'script-src-elem', 'style-src', 'style-src-elem'];
+  const out = directives.map((d) => {
+    const name = nameOf(d);
+    if (NONCED.includes(name)) return add(d, `'nonce-${nonce}'`);
+    if (name === 'connect-src') return add(d, "'self'");
+    return d;
+  });
+
+  // A missing script-src/style-src falls back to default-src, so the policy
+  // still constrains the banner. Copying default-src into an explicit
+  // directive and adding the nonce there keeps everything else -- images,
+  // frames, the app's own rules -- exactly as the app set them.
+  if (defaultSrc) {
+    for (const name of ['script-src', 'style-src']) {
+      if (!present.has(name)) out.push(add(rename(defaultSrc, name), `'nonce-${nonce}'`));
+    }
+    // Only when the fallback would not already have allowed it, so a policy
+    // that permits same-origin XHR comes back byte-for-byte unchanged.
+    if (!present.has('connect-src') && !allowsSelf(defaultSrc)) {
+      out.push(add(rename(defaultSrc, 'connect-src'), "'self'"));
+    }
+  }
+
+  return out.join('; ');
+}
 
 const proxyCommon = {
   target: UPSTREAM_URL,
@@ -923,6 +1426,10 @@ const proxyCommon = {
       // so a client cannot forge the claim by sending the header itself.
       proxyReq.setHeader('X-Temp-Access-Email', req.session?.email || '');
       proxyReq.setHeader('X-Temp-Access-Grant', req.session?.grantId || '');
+      // Proof that a request came through the gateway. Only useful if the app
+      // rejects requests without it -- see the integration step in DEPLOY.md.
+      // Set unconditionally for the same reason as the headers above.
+      if (UPSTREAM_SHARED_SECRET) proxyReq.setHeader(UPSTREAM_SECRET_HEADER, UPSTREAM_SHARED_SECRET);
     },
     error: (err, _req, res) => {
       console.error('proxy error:', err.message);
@@ -947,14 +1454,25 @@ const proxyHtml = createProxyMiddleware({
     proxyRes: responseInterceptor(async (buffer, proxyRes, _req, res) => {
       const type = proxyRes.headers['content-type'] || '';
       if (!type.includes('text/html')) return buffer;
+
+      const nonce = crypto.randomBytes(16).toString('base64');
       if (STRIP_UPSTREAM_CSP) {
         res.removeHeader('content-security-policy');
         res.removeHeader('content-security-policy-report-only');
+      } else {
+        for (const header of ['content-security-policy', 'content-security-policy-report-only']) {
+          const current = res.getHeader(header) ?? proxyRes.headers[header];
+          if (!current) continue;
+          const value = Array.isArray(current) ? current.join('; ') : String(current);
+          res.setHeader(header, relaxCspForBanner(value, nonce));
+        }
       }
+
+      const banner = bannerScript(nonce);
       const html = buffer.toString('utf8');
       return html.includes('</body>')
-        ? html.replace('</body>', `${bannerScript}</body>`)
-        : html + bannerScript;
+        ? html.replace('</body>', `${banner}</body>`)
+        : html + banner;
     }),
   },
 });
@@ -999,12 +1517,13 @@ app.use((err, _req, res, _next) => {
 // that closed hours ago.
 async function sweepExpired() {
   try {
-    const { rows } = await pool.query(
+    // Clock one: the access window ran out.
+    const closed = await pool.query(
       `UPDATE access_grants SET status = 'EXPIRED'
        WHERE status = 'ACTIVE' AND expires_at IS NOT NULL AND expires_at <= now()
        RETURNING id`
     );
-    for (const row of rows) {
+    for (const row of closed.rows) {
       cacheBust(row.id);
       await audit(null, {
         grantId: row.id,
@@ -1013,7 +1532,29 @@ async function sweepExpired() {
         detail: { reason: 'sweeper' },
       });
     }
-    if (rows.length) console.log(`sweeper: expired ${rows.length} grant(s)`);
+
+    // Clock two: the link was never opened. A separate event, so the two
+    // clocks stay separable in the audit log -- "they ran out of time" and
+    // "they never showed up" are different facts about a customer, and the
+    // log is where that question gets answered later.
+    const unopened = await pool.query(
+      `UPDATE access_grants SET status = 'EXPIRED'
+       WHERE status = 'PENDING' AND created_at < now() - ($1 || ' hours')::interval
+       RETURNING id`,
+      [String(PENDING_EXPIRY_HOURS)]
+    );
+    for (const row of unopened.rows) {
+      cacheBust(row.id);
+      await audit(null, {
+        grantId: row.id,
+        event: 'GRANT_LINK_EXPIRED',
+        actor: 'system',
+        detail: { reason: 'sweeper', linkExpiryHours: PENDING_EXPIRY_HOURS },
+      });
+    }
+
+    if (closed.rows.length) console.log(`sweeper: expired ${closed.rows.length} access window(s)`);
+    if (unopened.rows.length) console.log(`sweeper: expired ${unopened.rows.length} unopened link(s)`);
   } catch (err) {
     console.error('sweeper failed:', err.message);
   }
@@ -1045,36 +1586,155 @@ async function checkAdminSetup() {
   }
 }
 
-const server = app.listen(PORT, () => {
-  console.log(`gateway listening on :${PORT}`);
+// Same "fail at boot, not at the first request" rule as the config block. A
+// gateway that starts without a database looks healthy and then 500s on the
+// first person who tries to get in, which is a worse way to find out.
+async function assertDatabaseReachable() {
+  try {
+    await pool.query('SELECT 1');
+  } catch (err) {
+    console.error(`Refusing to start. Cannot reach the database: ${err.message}`);
+    process.exit(1);
+  }
+}
+
+function isPublicAddress(address) {
+  try {
+    return ipaddr.parse(String(address).replace(/^::ffff:/i, '')).range() === 'unicast';
+  } catch {
+    return false;
+  }
+}
+
+// The gateway is worth exactly nothing if the app behind it is reachable
+// without it, and no code here can prove that it isn't -- the check that
+// matters is the firewall, plus auditing every DNS record and hardcoded URL
+// that points at the app directly. But an upstream on a routable address is a
+// strong hint the isolation was never set up, so say so at boot.
+async function warnIfUpstreamIsPublic() {
+  let hostname;
+  try {
+    hostname = new URL(UPSTREAM_URL).hostname;
+  } catch {
+    return;
+  }
+
+  let addresses;
+  try {
+    addresses = (await dns.lookup(hostname, { all: true })).map((a) => a.address);
+  } catch {
+    return; // unresolvable is the proxy's problem to report, not this check's
+  }
+
+  const publicAddresses = addresses.filter(isPublicAddress);
+  if (!publicAddresses.length) return;
+
+  console.warn(`  WARNING: UPSTREAM_URL resolves to a public address (${publicAddresses.join(', ')}).`);
+  console.warn('           If customers can reach the app directly, this gateway is decoration.');
+  if (!UPSTREAM_SHARED_SECRET) {
+    console.warn('           Set UPSTREAM_SHARED_SECRET and reject requests without it in the app.');
+  }
+}
+
+// Email failure is survivable -- grant creation hands the admin the password
+// to relay by hand -- so this warns rather than refusing to start. It is still
+// worth saying at boot, because the alternative is finding out from a customer
+// who never received their link.
+function checkEmailSetup() {
+  const provider = resolveEmailProvider();
+  if (provider.ready && process.env.EMAIL_FROM) {
+    console.log(`  email    : ${provider.name}`);
+    return;
+  }
+  const missing = provider.ready ? 'EMAIL_FROM' : provider.missing;
+  console.warn(`  WARNING: email is not configured (missing ${missing}). Grants will still be`);
+  console.warn('           created, but the admin has to relay each password by hand.');
+}
+
+// Exported rather than run on require, so the tests can start a gateway on an
+// ephemeral port and shut it down again.
+async function start({ handleSignals = false } = {}) {
+  await assertDatabaseReachable();
+
+  const server = await new Promise((resolve) => {
+    const s = app.listen(PORT, () => resolve(s));
+  });
+  const port = server.address().port;
+
+  // Registered before anything is awaited: the socket is already accepting
+  // connections, and an upgrade arriving in the meantime would otherwise be
+  // handled by nobody.
+  //
+  // Websocket upgrades bypass Express middleware entirely, so they need their
+  // own authorization check. Without this, a customer whose window has closed
+  // keeps a live socket into the app.
+  server.on('upgrade', async (req, socket, head) => {
+    try {
+      const result = await resolveSession(req);
+      if (!result.ok) return socket.destroy();
+      req.session = result.session;
+      proxyRaw.upgrade(req, socket, head);
+    } catch {
+      socket.destroy();
+    }
+  });
+
+  console.log(`gateway listening on :${port}`);
   console.log(`  upstream : ${UPSTREAM_URL}`);
   console.log(`  public   : ${process.env.PUBLIC_BASE_URL}`);
   console.log(`  admin    : ${process.env.PUBLIC_BASE_URL}${GATE}/admin`);
-  checkAdminSetup();
-});
+  checkEmailSetup();
+  await checkAdminSetup();
+  await warnIfUpstreamIsPublic();
 
-// Websocket upgrades bypass Express middleware entirely, so they need their
-// own authorization check. Without this, a customer whose window has closed
-// keeps a live socket into the app.
-server.on('upgrade', async (req, socket, head) => {
-  try {
-    const result = await resolveSession(req);
-    if (!result.ok) return socket.destroy();
-    req.session = result.session;
-    proxyRaw.upgrade(req, socket, head);
-  } catch {
-    socket.destroy();
-  }
-});
+  const sweepTimer = setInterval(() => {
+    sweepExpired();
+    sweepGrantCache();
+  }, SWEEP_INTERVAL_MS);
+  sweepExpired();
 
-const sweepTimer = setInterval(sweepExpired, SWEEP_INTERVAL_MS);
-sweepExpired();
-
-for (const sig of ['SIGTERM', 'SIGINT']) {
-  process.on(sig, () => {
-    console.log(`${sig} received, shutting down`);
+  const stop = async () => {
     clearInterval(sweepTimer);
-    server.close(() => pool.end().then(() => process.exit(0)));
-    setTimeout(() => process.exit(1), 10_000).unref();
+    await new Promise((resolve) => server.close(resolve));
+    await pool.end();
+  };
+
+  if (handleSignals) {
+    for (const sig of ['SIGTERM', 'SIGINT']) {
+      process.on(sig, () => {
+        console.log(`${sig} received, shutting down`);
+        clearInterval(sweepTimer);
+        server.close(() => pool.end().then(() => process.exit(0)));
+        setTimeout(() => process.exit(1), 10_000).unref();
+      });
+    }
+  }
+
+  return { server, port, stop };
+}
+
+if (require.main === module) {
+  start({ handleSignals: true }).catch((err) => {
+    console.error(`Refusing to start. ${err.message}`);
+    process.exit(1);
   });
 }
+
+module.exports = {
+  app,
+  start,
+  pool,
+  GATE,
+  // The sweeper runs on a timer in production; the tests drive it directly
+  // rather than waiting out an interval.
+  sweepExpired,
+  // Exported for the unit tests. Everything here is a pure function.
+  normaliseEmail,
+  escapeHtml,
+  isUuid,
+  isValidEmail,
+  isPublicAddress,
+  relaxCspForBanner,
+  renderAccessEmail,
+  resolveEmailProvider,
+};

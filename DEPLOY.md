@@ -97,6 +97,10 @@ The values that actually decide whether this works:
 | `JWT_SECRET` | 48 random bytes | Under 32 chars the gateway refuses to boot. Changing it later invalidates every live session. |
 | `DATABASE_SSL` | `true` for managed Postgres | Connection failures at boot. |
 | `ADMIN_IP_ALLOWLIST` | your VPN/office CIDRs | Left empty, the admin console answers the public internet. This is the cheapest strong control available -- use it. |
+| `UPSTREAM_SHARED_SECRET` | 32 random bytes | Left empty, anyone who learns the app's own address bypasses the gateway entirely. See step 7b -- it needs a matching check in the app. |
+| `AUDIT_RETENTION_MONTHS` | your policy, default 12 | Only read by `npm run prune-audit`. Nothing is deleted until that runs. |
+| `MAX_DURATION_HOURS` | `24` | A ceiling on the access window, not a default. The code's fallback is 720 (30 days) if this is unset -- set it explicitly. |
+| `PENDING_EXPIRY_HOURS` | `24` | How long an unopened link stays activatable. Unset, the code default is also 24. Not the same clock as the one above. |
 
 Lock the file down — it holds the key to the internal network:
 
@@ -181,6 +185,55 @@ curl -sS -m 5 http://<internal-app>:<port>/       # must fail
 Both failing is the whole point of the design. If either succeeds, the
 gateway is being bypassed.
 
+## 7b. Upstream isolation
+
+**This is an integration step, not a hardening note.** Everything else in this
+runbook is worthless if the app answers requests that did not come through the
+gateway. There are two halves, and you want both.
+
+**Network.** The app should accept connections only from the gateway host --
+a security group, a firewall rule, or binding to an interface the internet
+cannot reach. This is the half that actually enforces the property.
+
+**A shared secret**, as defence in depth for when the network half is wrong,
+which is a thing that happens quietly:
+
+```bash
+node -e "console.log(require('crypto').randomBytes(32).toString('base64url'))"
+```
+
+Put it in the gateway's `.env` as `UPSTREAM_SHARED_SECRET`. The gateway then
+sends it on every proxied request, overwriting anything the client tried to
+send under the same name. In the app, reject requests that do not carry it --
+about ten lines, wherever middleware goes. Express, for illustration:
+
+```js
+const SECRET = process.env.GATEWAY_SECRET;
+app.use((req, res, next) => {
+  const given = req.get('X-Gateway-Secret') || '';
+  const ok = given.length === SECRET.length
+    && require('crypto').timingSafeEqual(Buffer.from(given), Buffer.from(SECRET));
+  if (!ok) return res.status(403).send('Direct access is not permitted.');
+  next();
+});
+```
+
+Health checks and anything else that must reach the app directly need an
+explicit exemption -- decide that deliberately rather than discovering it when
+monitoring goes red.
+
+**Then audit every path that points at the app directly.** This is the single
+most likely way a real deployment ends up worthless:
+
+- DNS records resolving to the app's own address (including stale ones)
+- hardcoded URLs in the app's own pages, emails, scripts and mobile clients
+- bookmarks and links in the client's internal documentation
+- other services that call the app and have their own route to it
+
+The gateway warns at boot if `UPSTREAM_URL` resolves to a public address, but
+that catches only the most obvious case. Nothing in software can do this audit
+for you.
+
 ## 8. Verify
 
 ```bash
@@ -201,13 +254,77 @@ and walk the flow once end to end.
 
 ## Email
 
-Resend without a verified domain will only send **from** `onboarding@resend.dev`
-**to** the address the account was registered with. Real customers will not
-receive anything until a domain is verified at
-[resend.com/domains](https://resend.com/domains) and `EMAIL_FROM` points at it.
+Resend is what this runs on. SES is supported behind the same interface
+(`EMAIL_PROVIDER`, or inferred from whichever credentials are present) so the
+provider is a config-level swap rather than a rewrite -- but it is not a
+security improvement over Resend, and changing provider is not security work.
 
-Until then the admin console still works: a failed send returns the password
-on screen for the admin to relay by hand, and the grant itself is valid.
+### Domain verification -- start this first
+
+**This is the longest lead time in the project.** It depends on the client's
+DNS, which depends on whoever owns their DNS, and nothing else here is blocked
+by anyone but you.
+
+- `EMAIL_FROM=access@mail.theircompany.com` -- a **subdomain**, so the sending
+  reputation of these messages is isolated from their corporate mail. A spam
+  complaint about an access link should not touch their invoices.
+- The client adds Resend's **SPF and DKIM** records at
+  [resend.com/domains](https://resend.com/domains).
+- **DMARC at `p=none`** initially. Tightening it later is a decision to take
+  with real delivery data, not before.
+- `PUBLIC_BASE_URL` must be the real HTTPS origin. `COOKIE_SECURE` is derived
+  from it and every emailed link is built from it -- a wrong value ships dead
+  links with insecure cookies, and both failures land on the customer.
+
+Until the domain is verified, Resend sends only **from** `onboarding@resend.dev`
+**to** the address the account was registered with. Real customers receive
+nothing.
+
+### Plan limits
+
+The free tier is 3,000 emails a month and **100 a day**, which is comfortably
+above the expected volume. The daily cap is the one that bites: onboarding more
+than ~90 people in a single day needs a plan upgrade arranged first, not
+discovered at grant 101.
+
+### Delivery is not visible
+
+A `200` from the provider means the message was accepted, not delivered. A
+later bounce or spam-filter drop is invisible here: the admin sees success, the
+customer sees nothing, and an audit log that said *sent* would side with the
+admin. So it says `GRANT_EMAIL_ACCEPTED`, and the console says *accepted for
+delivery*. Delivery webhooks would close the gap and are not on the free plan.
+
+When a customer says the email never arrived, the answer is **Revoke and
+reissue** in the console -- one action, and it produces a new password for the
+admin to read out. There is deliberately no stored plaintext password to
+re-send. That path records `GRANT_PASSWORD_RELAYED` alongside the usual
+`GRANT_CREATED`: a credential leaving the system by a route other than the
+email is worth being able to account for later.
+
+### SES, if the provider ever changes
+
+`SES_REGION`, `SES_ACCESS_KEY_ID`, `SES_SECRET_ACCESS_KEY`. Two things catch
+people out: a new SES account is **sandboxed** and can only send to verified
+addresses until you request production access, and `EMAIL_FROM` must be a
+verified identity in that region. Use an IAM user scoped to `ses:SendEmail` and
+nothing else.
+
+### Account hygiene
+
+- The Resend API key is scoped to **sending only** -- no log read permission.
+  The key sits on an internet-facing VM; it should not be able to read the
+  message bodies, which contain live credentials.
+- **2FA on the Resend account itself.** Whoever holds it can read delivery logs
+  and change the sending domain.
+
+Whichever provider is configured, the console still works when a send fails
+outright: the password comes back on screen for the admin to relay by hand, and
+the grant itself is valid. The gateway logs which provider it resolved at boot
+and warns when none is configured.
+
+**Issue a grant to yourself and confirm the email actually arrives** before
+handover, and again after any change of provider or sending domain.
 
 ## Operating notes
 
@@ -225,11 +342,63 @@ Restarting drops live sessions only if `JWT_SECRET` changed; otherwise
 customers keep working, since sessions are stateless and re-checked against
 Postgres on every request.
 
-**Backups.** `access_grants` is small; `audit_log` grows forever by design.
+**Backups.** Postgres is local to this VM, so a lost VM is lost access records.
+Nightly `pg_dump`, plus provider snapshots of the instance itself:
 
 ```bash
-pg_dump "$DATABASE_URL" | gzip > /var/backups/temp-access-$(date +%F).sql.gz
+# /etc/cron.d/temp-access-backup
+# cron does not read .env, hence the explicit source; % must be escaped here.
+30 2 * * * tempaccess set -a; . /opt/temp-access/.env; set +a; pg_dump "$DATABASE_URL" | gzip > /var/backups/temp-access-$(date +\%F).sql.gz
 ```
+
+**Restore the backup once, before handover.** Into a scratch database, and
+check the row counts. An untested backup is a belief, not a control.
+
+**Audit retention.** `audit_log` is append-only and nothing deletes from it
+until you schedule this. The default window is 12 months
+(`AUDIT_RETENTION_MONTHS`); set it to whatever the client's policy says, and
+know the answer before their compliance people ask:
+
+```bash
+# /etc/cron.d/temp-access-prune
+0 3 * * 0 tempaccess cd /opt/temp-access && npm run prune-audit
+```
+
+Check what it would remove first with `npm run prune-audit -- --dry-run`. The
+prune writes an `AUDIT_PRUNED` row of its own, so the shortening is itself in
+the log.
+
+**Monitoring.** `GET /__access/health` is unauthenticated by design -- point an
+uptime check at it. The gateway being down does not merely degrade the app: it
+makes the app unreachable for every temporary user, and the people affected are
+the ones least able to tell you.
+
+**Log rotation.** Everything goes to the systemd journal, which is not capped
+by default on every distro:
+
+```bash
+sudo sed -i 's/^#SystemMaxUse=.*/SystemMaxUse=500M/' /etc/systemd/journald.conf
+sudo systemctl restart systemd-journald
+```
+
+**Unattended security upgrades** on the host, since this VM is internet-facing:
+
+```bash
+sudo apt install unattended-upgrades && sudo dpkg-reconfigure -plow unattended-upgrades
+```
+
+**Rotating `JWT_SECRET`.** This is the break-glass response to a suspected leak
+of the secret itself. Changing it invalidates **every** live customer session
+and **every** admin session at once, immediately -- customers must log in again
+with their emailed credentials (which still work; the grants are unaffected),
+and admins must sign in again. Grants themselves are not touched. Rotate it by
+editing `.env` and restarting.
+
+**Admin account recovery** requires SSH plus `npm run create-admin`. That is
+deliberate -- it means an internet-facing password reset does not exist for the
+credential that mints access to the internal network. It also means **at least
+two people must have host access**. One person holding it is one resignation
+away from a client who cannot issue access at all.
 
 **Removing an admin.** Takes effect on their next request, no restart needed:
 
@@ -257,10 +426,24 @@ events worth alerting on -- repeated ones mean someone is probing the console.
 access link opened from a different IP or browser than the one that first
 activated it, which is what a forwarded or intercepted link looks like.
 
+`GRANT_EXPIRED` and `GRANT_LINK_EXPIRED` are deliberately different events.
+The first means the access window ran out; the second means the link was never
+opened within `PENDING_EXPIRY_HOURS`. "They ran out of time" and "they never
+showed up" are different facts about a customer, and this log is where that
+question gets answered months later.
+
 ## Troubleshooting
 
 | Symptom | Cause |
 |---|---|
+| Exits at boot with `Cannot reach the database` | Postgres is down or `DATABASE_URL` is wrong. Deliberate: the gateway refuses to start rather than 500ing on the first customer. |
+| Customer sign-in returns 429 | Either the per-IP throttle, or that grant is locked after `GRANT_MAX_FAILED_ATTEMPTS` failures (`GRANT_LOCKED` in the audit log). The message names the wait. Issuing a fresh grant also clears it. |
+| Issuing a grant returns 409 | That person already has a live (`PENDING` or `ACTIVE`) grant. The console offers **Revoke and reissue** as one action; revoking ends any session in progress immediately. |
+| Customer says the link says "Link expired" | It was not opened within `PENDING_EXPIRY_HOURS` (24h). Reissue -- that is a new grant and a new password, by design. |
+| Customer says the email never arrived | The provider accepted it; delivery is not visible from here. Check their spam folder, then **Revoke and reissue**. Verify SPF/DKIM are actually in the client's DNS. |
+| Duration options missing from the console | It only offers what `MAX_DURATION_HOURS` allows, read from `/auth/me` at load. |
+| Countdown bar missing on the app's pages | The app's CSP. The gateway nonces the banner into `script-src`/`style-src` automatically; if a policy defeats that, `STRIP_UPSTREAM_CSP=true` is the escape hatch, at the cost of the app's own CSP. |
+| `WARNING: UPSTREAM_URL resolves to a public address` | The app may be reachable without the gateway. See step 7b. |
 | Admin console 404s from your own machine | Your IP is outside `ADMIN_IP_ALLOWLIST` or nginx's `allow` list. Check the `ADMIN_IP_DENIED` audit rows for the address it actually saw. |
 | Admin sign-in 401s with the right password | The account is locked (`ADMIN_LOCKED` in the audit log). Wait `ADMIN_LOCKOUT_MINUTES`, or re-run `npm run create-admin`. |
 | Admin sign-in returns 429 | Per-IP throttle; waits out `ADMIN_LOGIN_RATE_WINDOW_MINUTES`. |

@@ -13,6 +13,28 @@ const express = require('express');
 const app = express();
 const PORT = Number(process.env.DEMO_PORT || 4000);
 
+// The app-side half of upstream isolation, and the reference for the snippet
+// in DEPLOY.md. The gateway is only worth something if the app refuses
+// requests that did not come through it, and that check has to live here --
+// nothing the gateway does can enforce it from the outside.
+//
+// Off unless GATEWAY_SECRET is set, so `npm run demo-app` still just works.
+// In a real deployment it is not optional, and the network should be
+// enforcing the same property independently.
+const GATEWAY_SECRET = process.env.GATEWAY_SECRET || '';
+if (GATEWAY_SECRET) {
+  const crypto = require('crypto');
+  const expected = Buffer.from(GATEWAY_SECRET);
+  app.use((req, res, next) => {
+    const given = Buffer.from(req.header('X-Gateway-Secret') || '');
+    // Length-checked first: timingSafeEqual throws on a length mismatch.
+    const ok = given.length === expected.length && crypto.timingSafeEqual(given, expected);
+    if (!ok) return res.status(403).type('text/plain').send('Direct access is not permitted.');
+    next();
+  });
+  console.log('demo-app: requiring X-Gateway-Secret on every request');
+}
+
 // Root-relative, and deliberately named to collide with the gate's own
 // vocabulary. The /__access namespace is what keeps these separate.
 app.get('/app.css', (_req, res) => {

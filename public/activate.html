@@ -61,9 +61,14 @@
       const data = await res.json();
 
       if (!res.ok) {
-        setBadge('error', 'Invalid');
+        // A link that timed out before anyone opened it is a different fact
+        // from one that was never valid, and the customer can act on the
+        // difference: one means "ask for another", the other means something
+        // is wrong. The server names which it is.
+        const expired = data.reason === 'link_expired';
+        setBadge('error', expired ? 'Expired' : 'Invalid');
         $('eyebrow').textContent = 'Access link';
-        $('title').textContent = 'Not available';
+        $('title').textContent = expired ? 'Link expired' : 'Not available';
         $('message').textContent = data.error || 'This link could not be verified.';
         $('countdown').textContent = '';
         $('countdownLabel').textContent = '';

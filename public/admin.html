@@ -38,18 +38,34 @@
         </div>
       </div>
 
+      <p class="muted" id="clockHint">&nbsp;</p>
+
       <button class="primary" id="submit">Grant access</button>
       <div class="error-text" id="errorText"></div>
+
+      <!-- Shown when the address already has a live grant: before submit from
+           the lookup, or after a 409. Revoking is never automatic -- it ends
+           whatever the current holder is doing, so it takes a click that says
+           so. -->
+      <div class="notice" id="collision" style="display:none">
+        <p class="notice-title" id="collisionTitle"></p>
+        <p class="muted" id="collisionDetail"></p>
+        <p class="muted">
+          Revoking ends any session in progress <b>immediately</b> — if they are
+          working in the application right now, they are signed out mid-task.
+        </p>
+        <div class="notice-actions">
+          <button class="mini" id="revokeReissue">Revoke and reissue</button>
+          <button class="mini neutral" id="collisionDismiss">Leave it alone</button>
+        </div>
+      </div>
 
       <div id="resultWrap" style="display:none; margin-top:20px">
         <div class="kv"><span>Status</span><span id="rStatus">&mdash;</span></div>
         <div class="kv"><span>Email</span><span id="rEmail">&mdash;</span></div>
         <div class="cred" id="rUrl"></div>
         <div id="rPasswordWrap" style="display:none">
-          <p class="muted" style="margin:12px 0 0">
-            The email did not send. Relay this password to the customer yourself
-            &mdash; it is shown once and is not recoverable.
-          </p>
+          <p class="muted" id="rPasswordNote" style="margin:12px 0 0"></p>
           <div class="cred" id="rPassword"></div>
         </div>
       </div>
@@ -115,6 +131,65 @@
 
   const BADGE = { PENDING: 'pending', ACTIVE: 'active', EXPIRED: 'error', REVOKED: 'error' };
 
+  // Filled in from /auth/me, so the console never offers a duration the
+  // server would reject and can state the link's own deadline.
+  let limits = { maxDurationHours: null, pendingExpiryHours: null };
+
+  // The live grant currently standing in the way, if any.
+  let collidingGrant = null;
+
+  function hoursLabel(h) { return h + (h === 1 ? ' hour' : ' hours'); }
+
+  function showCollision(grant, title) {
+    collidingGrant = grant;
+    $('collisionTitle').textContent = title;
+    $('collisionDetail').textContent = grant.status === 'ACTIVE'
+      ? 'Active until ' + fmtDate(grant.expires_at) + '.'
+      : 'Issued ' + fmtDate(grant.created_at) + ', link not opened yet.';
+    $('collision').style.display = 'block';
+  }
+
+  function hideCollision() {
+    collidingGrant = null;
+    $('collision').style.display = 'none';
+  }
+
+  // Every lookup and every submit takes a ticket. A reply that comes back
+  // after something newer started is dropped -- without this, the lookup fired
+  // by the field losing focus lands *after* the grant it was checking for has
+  // been created, and reports a collision with the row we just made.
+  let lookupSeq = 0;
+
+  // Before submit rather than after: a collision the admin can see is a
+  // decision, and the same thing discovered as an error afterwards is a
+  // surprise. Best-effort -- the server enforces the invariant either way.
+  async function checkLive(email) {
+    const seq = ++lookupSeq;
+    if (!email) return hideCollision();
+    try {
+      const res = await api('/__access/api/admin/grants/live?email=' + encodeURIComponent(email));
+      if (seq !== lookupSeq) return;
+      if (!res.ok) return hideCollision();
+      const { grant } = await res.json();
+      if (seq !== lookupSeq) return;
+      if (!grant) return hideCollision();
+      showCollision(grant, 'This person already has a live grant.');
+    } catch (e) {
+      // A failed lookup must not block issuing access; the server still refuses
+      // a duplicate, which is the check that actually matters.
+      if (e.message !== 'unauthenticated' && seq === lookupSeq) hideCollision();
+    }
+  }
+
+  // Points at the row the admin needs to act on. Scrolling to it matters more
+  // than the colour: the grant they collided with may be well down the list.
+  function highlightGrant(id) {
+    const row = document.querySelector('tr[data-grant-id="' + id + '"]');
+    if (!row) return;
+    row.classList.add('highlight');
+    row.scrollIntoView({ block: 'center', behavior: 'smooth' });
+  }
+
   async function loadGrants() {
     try {
       const res = await api('/__access/api/admin/grants');
@@ -142,6 +217,7 @@
 
       for (const g of grants) {
         const tr = document.createElement('tr');
+        tr.dataset.grantId = g.id;
         tr.appendChild(td(g.email, 'mono'));
 
         const statusTd = document.createElement('td');
@@ -161,6 +237,17 @@
           btn.textContent = 'Revoke';
           btn.addEventListener('click', () => revoke(g.id, btn));
           actionTd.appendChild(btn);
+
+          // The provider accepting a message is not delivery, so a customer
+          // can be sitting on a link that never arrived. There is deliberately
+          // no stored plaintext password to re-send, so the answer is a new
+          // grant: revoke this one and issue another.
+          const again = document.createElement('button');
+          again.className = 'mini neutral';
+          again.textContent = 'Reissue';
+          again.title = 'Revoke this grant and issue a new one to the same address';
+          again.addEventListener('click', () => startReissue(g));
+          actionTd.appendChild(again);
         }
         tr.appendChild(actionTd);
         body.appendChild(tr);
@@ -192,7 +279,11 @@
     }
   }
 
-  $('submit').addEventListener('click', async () => {
+  // The one path that issues a grant, shared by the button and by
+  // revoke-and-reissue.
+  async function createGrant({ relay = false } = {}) {
+    // Supersedes any lookup still in flight -- see lookupSeq above.
+    lookupSeq++;
     const btn = $('submit');
     $('errorText').classList.remove('show');
     $('resultWrap').style.display = 'none';
@@ -207,38 +298,119 @@
         body: JSON.stringify({
           email: $('email').value.trim(),
           durationHours: Number($('duration').value),
+          // Asks for the password back so the admin can read it out. Only set
+          // on reissue, where the reason for reissuing is usually that the
+          // last email was accepted and never arrived.
+          relay,
         }),
       });
       const data = await res.json();
       btn.disabled = false;
       btn.textContent = 'Grant access';
 
-      if (!res.ok && res.status !== 202) {
-        showError(data.error || 'Request failed.');
-        return;
+      // At most one live grant per person, refused by the server. Say it in
+      // the terms the admin is thinking in -- "revoke the one they have" --
+      // and offer that as a single action, rather than leaving them to find
+      // the row, revoke it, and retype the form.
+      if (res.status === 409 && data.existingGrant) {
+        showCollision(data.existingGrant, data.error);
+        await loadGrants();
+        highlightGrant(data.existingGrant.id);
+        return false;
       }
 
+      if (!res.ok && res.status !== 202) {
+        showError(data.error || 'Request failed.');
+        return false;
+      }
+
+      hideCollision();
       $('resultWrap').style.display = 'block';
       $('rEmail').textContent = data.grant.email;
       $('rUrl').textContent = data.accessUrl;
 
-      if (data.warning) {
-        $('rStatus').textContent = 'Created, email failed';
+      // Accepted, not delivered. The provider took the message; a bounce or a
+      // spam filter after that is invisible from here, and telling an admin
+      // "Sent" claims something nobody has checked.
+      $('rStatus').textContent = data.warning ? 'Created, email failed' : 'Accepted for delivery';
+
+      if (data.password) {
+        $('rPasswordNote').textContent = data.warning
+          ? 'The email did not send. Relay this password to the customer yourself'
+            + ' — it is shown once and is not recoverable.'
+          : 'Read this password to the customer yourself. It is shown once and is'
+            + ' not recoverable; if it is lost, reissue again.';
         $('rPasswordWrap').style.display = 'block';
         $('rPassword').textContent = data.password;
-      } else {
-        $('rStatus').textContent = 'Sent';
       }
 
       $('email').value = '';
       await loadGrants();
+      return true;
     } catch (e) {
-      if (e.message === 'unauthenticated') return;
+      if (e.message === 'unauthenticated') return false;
       btn.disabled = false;
       btn.textContent = 'Grant access';
       showError('Could not reach the server.');
+      return false;
+    }
+  }
+
+  $('submit').addEventListener('click', createGrant);
+
+  // Checked when the admin leaves the field, so a collision shows up before
+  // they commit rather than as an error afterwards.
+  $('email').addEventListener('blur', () => checkLive($('email').value.trim()));
+  $('email').addEventListener('input', () => { if (collidingGrant) hideCollision(); });
+
+  // Loads the form from an existing grant and asks for confirmation. Used by
+  // the Reissue button on a live row -- most often because the customer never
+  // received the email, which the provider's "accepted" tells us nothing about.
+  function startReissue(grant) {
+    $('email').value = grant.email;
+    const hours = Math.round((grant.duration_seconds || 3600) / 3600);
+    if (![...$('duration').options].some((o) => Number(o.value) === hours)) {
+      const opt = document.createElement('option');
+      opt.value = String(hours);
+      opt.textContent = hoursLabel(hours);
+      $('duration').appendChild(opt);
+    }
+    $('duration').value = String(hours);
+    showCollision(grant, 'Reissuing to ' + grant.email + '.');
+    $('collision').scrollIntoView({ block: 'center', behavior: 'smooth' });
+  }
+
+  // Revoke, then issue -- in that order, and behind a click. Auto-revoking on
+  // collision would silently cut someone off mid-task to make room for a grant
+  // nobody has confirmed they want.
+  $('revokeReissue').addEventListener('click', async () => {
+    if (!collidingGrant) return;
+    const btn = $('revokeReissue');
+    btn.disabled = true;
+    btn.textContent = 'Revoking...';
+
+    try {
+      const res = await api('/__access/api/admin/grants/' + collidingGrant.id + '/revoke', {
+        ...JSON_OPTS,
+        method: 'POST',
+      });
+      btn.disabled = false;
+      btn.textContent = 'Revoke and reissue';
+      if (!res.ok) {
+        showError('Revoke failed, so nothing was reissued.');
+        return;
+      }
+      hideCollision();
+      await createGrant({ relay: true });
+    } catch (e) {
+      if (e.message === 'unauthenticated') return;
+      btn.disabled = false;
+      btn.textContent = 'Revoke and reissue';
+      showError('Could not reach the server.');
     }
   });
+
+  $('collisionDismiss').addEventListener('click', hideCollision);
 
   $('signOut').addEventListener('click', async () => {
     try {
@@ -249,14 +421,39 @@
     window.location.href = '/__access/admin-login';
   });
 
+  // The console should never offer a duration the server will reject, and it
+  // should be able to state the link's own deadline -- both come from the
+  // server rather than being duplicated as constants here.
+  function applyLimits(me) {
+    limits = me;
+    if (me.maxDurationHours) {
+      for (const opt of [...$('duration').options]) {
+        if (Number(opt.value) > me.maxDurationHours) opt.remove();
+      }
+      if (!$('duration').options.length) {
+        const opt = document.createElement('option');
+        opt.value = String(me.maxDurationHours);
+        opt.textContent = hoursLabel(me.maxDurationHours);
+        $('duration').appendChild(opt);
+      }
+    }
+    if (me.pendingExpiryHours) {
+      // The two clocks, said once, where the admin is choosing between them.
+      $('clockHint').textContent = 'The link must be opened within '
+        + hoursLabel(me.pendingExpiryHours)
+        + '. The access window above starts when they open it, not now.';
+    }
+  }
+
   // Establish who we are before showing anything, so an unauthenticated
   // visitor never sees the console chrome at all.
   (async () => {
     try {
       const res = await api('/__access/api/admin/auth/me');
       if (!res.ok) return toLogin();
-      const { email } = await res.json();
-      $('whoEmail').textContent = email;
+      const me = await res.json();
+      $('whoEmail').textContent = me.email;
+      applyLimits(me);
       $('shell').style.display = 'block';
       consoleLoaded = true;
       await loadGrants();

@@ -302,3 +302,28 @@ button.mini:disabled { opacity: 0.35; cursor: not-allowed; }
 /* Sign out is not destructive, so it shouldn't wear the revoke button's red. */
 button.mini.neutral { color: var(--slate); }
 button.mini.neutral:hover { border-color: var(--slate); }
+
+/* Marks the grant an admin has just collided with -- one open grant per
+   person, so the row they need to revoke is the answer to the error above. */
+tr.highlight td {
+  background: rgba(201,162,39,0.16);
+  animation: highlight-fade 4s ease-out forwards;
+}
+@keyframes highlight-fade {
+  0%, 60% { background: rgba(201,162,39,0.16); }
+  100% { background: transparent; }
+}
+
+/* Shown when an address already has a live grant -- a decision to make, not
+   an error that happened, so it reads as a prompt rather than a failure. */
+.notice {
+  margin-top: 16px;
+  padding: 14px 16px;
+  background: rgba(201,162,39,0.10);
+  border: 1px solid rgba(201,162,39,0.45);
+  border-radius: 8px;
+  font-size: 13px;
+}
+.notice p { margin: 0 0 8px; }
+.notice .notice-title { color: var(--ink); font-weight: 600; }
+.notice-actions { display: flex; gap: 8px; margin-top: 12px; }
