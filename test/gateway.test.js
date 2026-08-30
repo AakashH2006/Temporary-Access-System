@@ -625,6 +625,10 @@ test('gateway', { skip: h.skip, concurrency: 1 }, async (t) => {
 
     const me = await (await admin('/__access/api/admin/auth/me')).json();
     assert.equal(me.email, 'admin@example.com');
+    // Both env vars are left empty by the harness, so these assert the code's
+    // own defaults -- which must agree with .env.example. A fallback that
+    // silently widens the ceiling when the variable is dropped is the failure
+    // this is here to catch.
     assert.equal(me.maxDurationHours, 24);
     assert.equal(me.pendingExpiryHours, 24);
   });

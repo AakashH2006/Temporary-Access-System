@@ -51,8 +51,13 @@ const COOKIE_SECURE = process.env.COOKIE_SECURE === 'true'
 //
 // MAX_DURATION_HOURS is a ceiling on the second, not a default -- the admin
 // names a duration on every grant and this only rejects values above it.
+//
+// The fallback matches .env.example deliberately. It used to be 720, so
+// dropping the variable silently widened the ceiling from a day to a month on
+// a system called temporary access -- the kind of default that is only ever
+// discovered by whoever is reviewing it.
 const SESSION_TTL_SECONDS = Number(process.env.SESSION_TTL_SECONDS || 3600);
-const MAX_DURATION_HOURS = Number(process.env.MAX_DURATION_HOURS || 24 * 30);
+const MAX_DURATION_HOURS = Number(process.env.MAX_DURATION_HOURS || 24);
 
 // How long an unopened access link stays activatable. Without this a grant
 // created and never opened stayed live indefinitely -- next month, next year

@@ -80,9 +80,13 @@ async function boot() {
     SES_SECRET_ACCESS_KEY: '',
     UPSTREAM_SHARED_SECRET: UPSTREAM_SECRET,
     GRANT_CACHE_TTL_MS: '50',
-    // The shipped ceilings, so the tests exercise what production runs.
-    MAX_DURATION_HOURS: '24',
-    PENDING_EXPIRY_HOURS: '24',
+    // Deliberately blank rather than '24': an empty value is falsy, so the code
+    // falls back to its own default and the assertions below cover that default
+    // instead of covering a number this file just set. These two are the
+    // shipped ceilings, and a default that quietly disagrees with
+    // .env.example is exactly the drift worth catching here.
+    MAX_DURATION_HOURS: '',
+    PENDING_EXPIRY_HOURS: '',
     GRANT_MAX_FAILED_ATTEMPTS: '3',
     GRANT_LOCKOUT_MINUTES: '15',
     ADMIN_MAX_FAILED_ATTEMPTS: '3',

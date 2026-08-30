@@ -99,7 +99,7 @@ The values that actually decide whether this works:
 | `ADMIN_IP_ALLOWLIST` | your VPN/office CIDRs | Left empty, the admin console answers the public internet. This is the cheapest strong control available -- use it. |
 | `UPSTREAM_SHARED_SECRET` | 32 random bytes | Left empty, anyone who learns the app's own address bypasses the gateway entirely. See step 7b -- it needs a matching check in the app. |
 | `AUDIT_RETENTION_MONTHS` | your policy, default 12 | Only read by `npm run prune-audit`. Nothing is deleted until that runs. |
-| `MAX_DURATION_HOURS` | `24` | A ceiling on the access window, not a default. The code's fallback is 720 (30 days) if this is unset -- set it explicitly. |
+| `MAX_DURATION_HOURS` | `24` | A ceiling on the access window, not a default. Same value if unset, so dropping it cannot widen the ceiling. |
 | `PENDING_EXPIRY_HOURS` | `24` | How long an unopened link stays activatable. Unset, the code default is also 24. Not the same clock as the one above. |
 
 Lock the file down — it holds the key to the internal network:
